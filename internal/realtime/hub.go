@@ -1,0 +1,151 @@
+package realtime
+
+import (
+	"encoding/json"
+	"sync"
+	"time"
+
+	"autobuff-monitor/server/internal/protocol"
+)
+
+type Room struct {
+	mu           sync.RWMutex
+	publisher    string
+	viewers      map[string]chan []byte
+	latestMap    json.RawMessage
+	latestFrame  json.RawMessage
+	latestStatus json.RawMessage
+	online       bool
+	updatedAt    int64
+}
+
+type Hub struct {
+	mu     sync.Mutex
+	rooms  map[string]*Room
+	closed bool
+}
+
+func NewHub() *Hub {
+	return &Hub{rooms: make(map[string]*Room)}
+}
+
+func (h *Hub) room(sessionID string) *Room {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room := h.rooms[sessionID]
+	if room == nil {
+		room = &Room{viewers: make(map[string]chan []byte)}
+		h.rooms[sessionID] = room
+	}
+	return room
+}
+
+func (h *Hub) AttachPublisher(sessionID, connectionID string) func() {
+	room := h.room(sessionID)
+	room.mu.Lock()
+	room.publisher = connectionID
+	room.online = true
+	room.updatedAt = time.Now().UnixMilli()
+	room.mu.Unlock()
+	room.broadcastSnapshot()
+
+	return func() {
+		room.mu.Lock()
+		if room.publisher == connectionID {
+			room.publisher = ""
+			room.online = false
+			room.updatedAt = time.Now().UnixMilli()
+		}
+		room.mu.Unlock()
+		room.broadcastSnapshot()
+	}
+}
+
+func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) {
+	room := h.room(sessionID)
+	room.mu.Lock()
+	switch envelope.Type {
+	case protocol.TypeMap:
+		room.latestMap = append(room.latestMap[:0], envelope.Payload...)
+	case protocol.TypeFrame:
+		room.latestFrame = append(room.latestFrame[:0], envelope.Payload...)
+	case protocol.TypeStatus:
+		room.latestStatus = append(room.latestStatus[:0], envelope.Payload...)
+	}
+	room.updatedAt = time.Now().UnixMilli()
+	room.mu.Unlock()
+	room.broadcast(raw)
+}
+
+func (h *Hub) Subscribe(sessionID, viewerID string) (<-chan []byte, func()) {
+	room := h.room(sessionID)
+	channel := make(chan []byte, 1)
+	room.mu.Lock()
+	room.viewers[viewerID] = channel
+	room.mu.Unlock()
+	if snapshot, err := json.Marshal(room.snapshot()); err == nil {
+		channel <- snapshot
+	}
+	return channel, func() {
+		room.mu.Lock()
+		if existing, ok := room.viewers[viewerID]; ok {
+			delete(room.viewers, viewerID)
+			close(existing)
+		}
+		room.mu.Unlock()
+	}
+}
+
+func (r *Room) snapshot() protocol.Snapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return protocol.Snapshot{
+		Type:      protocol.TypeSnapshot,
+		Online:    r.online,
+		Map:       append(json.RawMessage(nil), r.latestMap...),
+		Frame:     append(json.RawMessage(nil), r.latestFrame...),
+		Status:    append(json.RawMessage(nil), r.latestStatus...),
+		UpdatedAt: r.updatedAt,
+	}
+}
+
+func (r *Room) broadcastSnapshot() {
+	message, err := json.Marshal(r.snapshot())
+	if err == nil {
+		r.broadcast(message)
+	}
+}
+
+func (r *Room) broadcast(message []byte) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, channel := range r.viewers {
+		copyOfMessage := append([]byte(nil), message...)
+		select {
+		case channel <- copyOfMessage:
+		default:
+			select {
+			case <-channel:
+			default:
+			}
+			select {
+			case channel <- copyOfMessage:
+			default:
+			}
+		}
+	}
+}
+
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for _, room := range h.rooms {
+		room.mu.Lock()
+		for id, channel := range room.viewers {
+			delete(room.viewers, id)
+			close(channel)
+		}
+		room.mu.Unlock()
+	}
+}

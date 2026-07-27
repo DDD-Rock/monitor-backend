@@ -48,8 +48,30 @@ ALLOW_REGISTRATION=true
 - `GET /api/healthz`
 - `GET /ws/device?session_id=...`
 - `GET /ws/view?token=...`
+- `GET /api/preview/notifications/bark`
+- `PUT /api/preview/notifications/exp-stalled`
+- `PUT /api/preview/notifications/rune-alert`
+- `PUT /api/preview/notifications/zone-breach`
 
-发布端支持 `map`、`frame`、`status`、`exp` 和 `rune` 五类消息。`exp` 包含当前
-EXP、经验百分比、识别置信度、状态与识别时间。`rune` 包含符文提示是否出现、
-识别置信度和识别时间，客户端在状态翻转时立刻上报，状态不变时每 3 秒心跳重发
-一次。两者都会进入查看端首次连接时的最新快照。
+发布端支持 `map`、`frame`、`status`、`exp`、`rune` 和 `zone` 六类消息。`exp`
+包含当前 EXP、经验百分比、识别置信度、状态与识别时间。`rune` 包含符文提示是否
+出现、识别置信度和识别时间。`zone` 包含角色是否离开安全区，以及归一化的安全区
+矩形（左上角原点，`x/y/width/height` 都在 0~1，网页据此画框）；矩形为空表示
+本机没有配置安全区。
+
+`rune` 和 `zone` 都在状态翻转时立刻上报，状态不变时每 3 秒心跳重发一次，
+服务端据此判断数据是否新鲜。所有消息都会进入查看端首次连接时的最新快照。
+
+## 推送规则
+
+| 规则 key | 说明 | 间隔 |
+| --- | --- | --- |
+| `exp_stalled` | 经验持续无增长 | 10–86400 秒，可配置 |
+| `rune_alert` | 画面出现紫色符文提示 | 固定 5 秒 |
+| `zone_breach` | 角色离开安全区 | 固定 5 秒 |
+
+每条规则都有独立开关。`rune_alert` 和 `zone_breach` 只在上报处于 12 秒新鲜度
+窗口内时才推送，客户端掉线后最后一次告警会很快过期，不会无限推送。
+
+`exp_minute`（每分钟经验推送）已下线，升级时执行根目录的
+`zone_breach_migration.sql` 清掉残留规则行。

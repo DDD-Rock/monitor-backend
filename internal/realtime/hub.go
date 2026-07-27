@@ -17,6 +17,7 @@ type Room struct {
 	latestStatus json.RawMessage
 	latestEXP    json.RawMessage
 	latestRune   json.RawMessage
+	latestZone   json.RawMessage
 	online       bool
 	updatedAt    int64
 }
@@ -77,6 +78,8 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 		room.latestEXP = append(room.latestEXP[:0], envelope.Payload...)
 	case protocol.TypeRune:
 		room.latestRune = append(room.latestRune[:0], envelope.Payload...)
+	case protocol.TypeZone:
+		room.latestZone = append(room.latestZone[:0], envelope.Payload...)
 	}
 	room.updatedAt = time.Now().UnixMilli()
 	room.mu.Unlock()
@@ -145,6 +148,28 @@ func (h *Hub) LatestRune(sessionID string) (protocol.RunePayload, bool, bool) {
 	return payload, online, true
 }
 
+// LatestZone 返回会话最近一次上报的安全区状态、发布端是否在线，以及是否有过上报。
+func (h *Hub) LatestZone(sessionID string) (protocol.ZonePayload, bool, bool) {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return protocol.ZonePayload{}, false, false
+	}
+	room.mu.RLock()
+	raw := append(json.RawMessage(nil), room.latestZone...)
+	online := room.online
+	room.mu.RUnlock()
+	if len(raw) == 0 {
+		return protocol.ZonePayload{}, online, false
+	}
+	var payload protocol.ZonePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return protocol.ZonePayload{}, online, false
+	}
+	return payload, online, true
+}
+
 func (r *Room) snapshot() protocol.Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -156,6 +181,7 @@ func (r *Room) snapshot() protocol.Snapshot {
 		Status:    append(json.RawMessage(nil), r.latestStatus...),
 		EXP:       append(json.RawMessage(nil), r.latestEXP...),
 		Rune:      append(json.RawMessage(nil), r.latestRune...),
+		Zone:      append(json.RawMessage(nil), r.latestZone...),
 		UpdatedAt: r.updatedAt,
 	}
 }

@@ -9,12 +9,7 @@ import (
 )
 
 type saveBarkRequest struct {
-	DeviceKey        string `json:"deviceKey"`
-	EXPMinuteEnabled bool   `json:"expMinuteEnabled"`
-}
-
-type toggleEXPMinuteRequest struct {
-	Enabled bool `json:"enabled"`
+	DeviceKey string `json:"deviceKey"`
 }
 
 type toggleEXPStalledRequest struct {
@@ -23,6 +18,10 @@ type toggleEXPStalledRequest struct {
 }
 
 type toggleRuneAlertRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type toggleZoneBreachRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
@@ -42,7 +41,7 @@ func (s *Server) handleSaveBark(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if err := s.notify.SaveBark(r.Context(), user.ID, request.DeviceKey, request.EXPMinuteEnabled); err != nil {
+	if err := s.notify.SaveBark(r.Context(), user.ID, request.DeviceKey); err != nil {
 		if strings.Contains(err.Error(), "invalid Bark") {
 			writeError(w, http.StatusBadRequest, "invalid_device_key", "Bark DeviceKey 格式无效")
 			return
@@ -75,31 +74,6 @@ func (s *Server) handlePreviewBarkSettings(w http.ResponseWriter, r *http.Reques
 	settings, err := s.notify.Settings(r.Context(), userID)
 	if err != nil {
 		s.internalError(w, "query preview Bark settings failed", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, settings)
-}
-
-func (s *Server) handlePreviewEXPMinute(w http.ResponseWriter, r *http.Request) {
-	userID, ok := s.previewUserID(w, r)
-	if !ok {
-		return
-	}
-	var request toggleEXPMinuteRequest
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	if err := s.notify.SetEXPMinuteEnabled(r.Context(), userID, request.Enabled); err != nil {
-		if strings.Contains(err.Error(), "尚未配置") {
-			writeError(w, http.StatusConflict, "bark_not_configured", err.Error())
-			return
-		}
-		s.internalError(w, "update preview EXP notification failed", err)
-		return
-	}
-	settings, err := s.notify.Settings(r.Context(), userID)
-	if err != nil {
-		s.internalError(w, "query updated preview Bark settings failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, settings)
@@ -154,6 +128,31 @@ func (s *Server) handlePreviewRuneAlert(w http.ResponseWriter, r *http.Request) 
 	settings, err := s.notify.Settings(r.Context(), userID)
 	if err != nil {
 		s.internalError(w, "query updated rune alert settings failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) handlePreviewZoneBreach(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.previewUserID(w, r)
+	if !ok {
+		return
+	}
+	var request toggleZoneBreachRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.notify.SetZoneBreachEnabled(r.Context(), userID, request.Enabled); err != nil {
+		if strings.Contains(err.Error(), "尚未配置") {
+			writeError(w, http.StatusConflict, "bark_not_configured", err.Error())
+			return
+		}
+		s.internalError(w, "update preview zone breach failed", err)
+		return
+	}
+	settings, err := s.notify.Settings(r.Context(), userID)
+	if err != nil {
+		s.internalError(w, "query updated zone breach settings failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, settings)

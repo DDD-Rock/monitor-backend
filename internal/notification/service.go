@@ -18,9 +18,9 @@ import (
 
 const (
 	ProviderBark        = "bark"
-	RuleEXPMinute       = "exp_minute"
 	RuleEXPStalled      = "exp_stalled"
 	RuleRuneAlert       = "rune_alert"
+	RuleZoneBreach      = "zone_breach"
 	DefaultStallSeconds = 120
 	MinStallSeconds     = 10
 	MaxStallSeconds     = 86400
@@ -29,6 +29,10 @@ const (
 	// Mac 端每 3 秒心跳一次符文状态；超过这个时间没更新就当作数据过期，
 	// 避免客户端掉线后按最后一次上报无限推送。
 	RuneAlertFreshnessWindow = 12 * time.Second
+	// 角色仍在安全区外时，每 5 秒重复报警一次。
+	ZoneBreachIntervalSeconds = 5
+	// 与符文同理：Mac 端心跳停止后，最后一次「已越界」的上报很快过期。
+	ZoneBreachFreshnessWindow = 12 * time.Second
 	// 调度器每 5 秒扫一次，而 last_sent_at 记录的是这一轮推送完成的时刻，
 	// 总是比 tick 晚若干毫秒。不留容差的话每条规则都会顺延整整一个周期
 	// （5 秒变 10 秒、60 秒变 65 秒），因此允许提前 1 秒触发。
@@ -40,13 +44,14 @@ const (
 var barkDeviceKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 
 type Settings struct {
-	Configured               bool   `json:"configured"`
-	EXPMinuteEnabled         bool   `json:"expMinuteEnabled"`
-	EXPStalledEnabled        bool   `json:"expStalledEnabled"`
-	EXPStalledSeconds        int    `json:"expStalledSeconds"`
-	RuneAlertEnabled         bool   `json:"runeAlertEnabled"`
-	RuneAlertIntervalSeconds int    `json:"runeAlertIntervalSeconds"`
-	BarkServerURL            string `json:"barkServerURL"`
+	Configured                bool   `json:"configured"`
+	EXPStalledEnabled         bool   `json:"expStalledEnabled"`
+	EXPStalledSeconds         int    `json:"expStalledSeconds"`
+	RuneAlertEnabled          bool   `json:"runeAlertEnabled"`
+	RuneAlertIntervalSeconds  int    `json:"runeAlertIntervalSeconds"`
+	ZoneBreachEnabled         bool   `json:"zoneBreachEnabled"`
+	ZoneBreachIntervalSeconds int    `json:"zoneBreachIntervalSeconds"`
+	BarkServerURL             string `json:"barkServerURL"`
 }
 
 type Service struct {
@@ -85,9 +90,10 @@ func NewService(
 
 func (s *Service) Settings(ctx context.Context, userID int64) (Settings, error) {
 	settings := Settings{
-		BarkServerURL:            s.publicBarkURL,
-		EXPStalledSeconds:        DefaultStallSeconds,
-		RuneAlertIntervalSeconds: RuneAlertIntervalSeconds,
+		BarkServerURL:             s.publicBarkURL,
+		EXPStalledSeconds:         DefaultStallSeconds,
+		RuneAlertIntervalSeconds:  RuneAlertIntervalSeconds,
+		ZoneBreachIntervalSeconds: ZoneBreachIntervalSeconds,
 	}
 	var channelEnabled bool
 	err := s.db.QueryRowContext(
@@ -106,9 +112,9 @@ func (s *Service) Settings(ctx context.Context, userID int64) (Settings, error) 
 		`SELECT rule_key, enabled, interval_seconds FROM notification_rules
 		 WHERE user_id = ? AND rule_key IN (?, ?, ?)`,
 		userID,
-		RuleEXPMinute,
 		RuleEXPStalled,
 		RuleRuneAlert,
+		RuleZoneBreach,
 	)
 	if err != nil {
 		return Settings{}, err
@@ -122,19 +128,19 @@ func (s *Service) Settings(ctx context.Context, userID int64) (Settings, error) 
 			return Settings{}, err
 		}
 		switch ruleKey {
-		case RuleEXPMinute:
-			settings.EXPMinuteEnabled = enabled
 		case RuleEXPStalled:
 			settings.EXPStalledEnabled = enabled
 			settings.EXPStalledSeconds = normalizeStallSeconds(intervalSeconds)
 		case RuleRuneAlert:
 			settings.RuneAlertEnabled = enabled
+		case RuleZoneBreach:
+			settings.ZoneBreachEnabled = enabled
 		}
 	}
 	return settings, nil
 }
 
-func (s *Service) SaveBark(ctx context.Context, userID int64, deviceKey string, expMinuteEnabled bool) error {
+func (s *Service) SaveBark(ctx context.Context, userID int64, deviceKey string) error {
 	deviceKey = strings.TrimSpace(deviceKey)
 	if !barkDeviceKeyPattern.MatchString(deviceKey) {
 		return fmt.Errorf("invalid Bark DeviceKey")
@@ -162,27 +168,7 @@ func (s *Service) SaveBark(ctx context.Context, userID int64, deviceKey string, 
 	); err != nil {
 		return err
 	}
-	if err := upsertRule(ctx, tx, userID, expMinuteEnabled); err != nil {
-		return err
-	}
 	return tx.Commit()
-}
-
-func (s *Service) SetEXPMinuteEnabled(ctx context.Context, userID int64, enabled bool) error {
-	if enabled && !s.barkConfigured(ctx, userID) {
-		return fmt.Errorf("Bark DeviceKey 尚未配置")
-	}
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO notification_rules (user_id, rule_key, enabled, interval_seconds)
-		 VALUES (?, ?, ?, 60)
-		 ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), interval_seconds = 60,
-		 last_sent_at = IF(VALUES(enabled) = 1, NULL, last_sent_at)`,
-		userID,
-		RuleEXPMinute,
-		enabled,
-	)
-	return err
 }
 
 func (s *Service) SetEXPStalled(ctx context.Context, userID int64, enabled bool, seconds int) error {
@@ -235,6 +221,26 @@ func (s *Service) SetRuneAlertEnabled(ctx context.Context, userID int64, enabled
 	return err
 }
 
+// SetZoneBreachEnabled 控制「离开安全区报警」这个独立开关。
+// 与符文一致，间隔固定为 5 秒，不开放调节。
+func (s *Service) SetZoneBreachEnabled(ctx context.Context, userID int64, enabled bool) error {
+	if enabled && !s.barkConfigured(ctx, userID) {
+		return fmt.Errorf("Bark DeviceKey 尚未配置")
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO notification_rules (user_id, rule_key, enabled, interval_seconds)
+		 VALUES (?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), interval_seconds = VALUES(interval_seconds),
+		 last_sent_at = IF(VALUES(enabled) = 1, NULL, last_sent_at)`,
+		userID,
+		RuleZoneBreach,
+		enabled,
+		ZoneBreachIntervalSeconds,
+	)
+	return err
+}
+
 func (s *Service) barkConfigured(ctx context.Context, userID int64) bool {
 	var exists int
 	err := s.db.QueryRowContext(
@@ -245,20 +251,6 @@ func (s *Service) barkConfigured(ctx context.Context, userID int64) bool {
 		ProviderBark,
 	).Scan(&exists)
 	return err == nil
-}
-
-func upsertRule(ctx context.Context, tx *sql.Tx, userID int64, enabled bool) error {
-	_, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO notification_rules (user_id, rule_key, enabled, interval_seconds)
-		 VALUES (?, ?, ?, 60)
-		 ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), interval_seconds = 60,
-		 last_sent_at = IF(VALUES(enabled) = 1, NULL, last_sent_at)`,
-		userID,
-		RuleEXPMinute,
-		enabled,
-	)
-	return err
 }
 
 func (s *Service) SendTest(ctx context.Context, userID int64) error {
@@ -307,9 +299,9 @@ func (s *Service) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				s.processDueEXP(ctx)
 				s.processEXPStalls(ctx)
 				s.processDueRuneAlerts(ctx)
+				s.processDueZoneBreaches(ctx)
 			case <-ctx.Done():
 				return
 			}
@@ -488,74 +480,6 @@ func normalizeStallSeconds(value int) int {
 	return value
 }
 
-type dueEXPRule struct {
-	UserID           int64
-	SessionID        string
-	SecretCiphertext string
-}
-
-func (s *Service) processDueEXP(ctx context.Context) {
-	rows, err := s.db.QueryContext(
-		ctx,
-		`SELECT nr.user_id, ms.id, nc.secret_ciphertext
-		 FROM notification_rules nr
-		 JOIN notification_channels nc ON nc.user_id = nr.user_id
-		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id AND ms.status = 1
-		 WHERE nr.rule_key = ? AND nr.enabled = 1
-		   AND nc.provider = ? AND nc.enabled = 1
-		   AND (nr.last_sent_at IS NULL
-		        OR TIMESTAMPADD(SECOND, nr.interval_seconds, nr.last_sent_at)
-		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))`,
-		RuleEXPMinute,
-		ProviderBark,
-		scheduleSlack.Microseconds(),
-	)
-	if err != nil {
-		s.logger.Error("query due EXP notifications failed", "error", err)
-		return
-	}
-	defer rows.Close()
-
-	var due []dueEXPRule
-	for rows.Next() {
-		var item dueEXPRule
-		if err := rows.Scan(&item.UserID, &item.SessionID, &item.SecretCiphertext); err != nil {
-			s.logger.Error("scan due EXP notification failed", "error", err)
-			continue
-		}
-		due = append(due, item)
-	}
-	for _, item := range due {
-		s.sendEXP(ctx, item)
-	}
-}
-
-func (s *Service) sendEXP(ctx context.Context, item dueEXPRule) {
-	exp, online, ok := s.hub.LatestEXP(item.SessionID)
-	if !ok || !online || exp.CurrentEXP == nil || exp.Percent == nil {
-		return
-	}
-	if _, err := s.db.ExecContext(
-		ctx,
-		`UPDATE notification_rules SET last_sent_at = NOW(3)
-		 WHERE user_id = ? AND rule_key = ? AND enabled = 1`,
-		item.UserID,
-		RuleEXPMinute,
-	); err != nil {
-		s.logger.Error("reserve EXP notification schedule failed", "user_id", item.UserID, "error", err)
-		return
-	}
-	deviceKey, err := s.box.open(item.SecretCiphertext)
-	if err == nil {
-		body := fmt.Sprintf("EXP %s · %s%%", formatInteger(*exp.CurrentEXP), formatPercent(*exp.Percent))
-		err = s.bark.push(ctx, deviceKey, body, "")
-	}
-	s.recordDelivery(ctx, item.UserID, RuleEXPMinute, err)
-	if err != nil {
-		s.logger.Warn("send Bark EXP notification failed", "user_id", item.UserID, "error", err)
-	}
-}
-
 type dueRuneAlertRule struct {
 	UserID           int64
 	SessionID        string
@@ -635,6 +559,86 @@ func runeAlertActive(payload protocol.RunePayload, now time.Time) bool {
 	}
 	age := now.Sub(time.UnixMilli(payload.DetectedAt))
 	return age >= -RuneAlertFreshnessWindow && age <= RuneAlertFreshnessWindow
+}
+
+type dueZoneBreachRule struct {
+	UserID           int64
+	SessionID        string
+	SecretCiphertext string
+}
+
+// processDueZoneBreaches 找出所有开启了越界报警、且距上次推送已满 5 秒的用户。
+func (s *Service) processDueZoneBreaches(ctx context.Context) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT nr.user_id, ms.id, nc.secret_ciphertext
+		 FROM notification_rules nr
+		 JOIN notification_channels nc ON nc.user_id = nr.user_id
+		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id AND ms.status = 1
+		 WHERE nr.rule_key = ? AND nr.enabled = 1
+		   AND nc.provider = ? AND nc.enabled = 1
+		   AND (nr.last_sent_at IS NULL
+		        OR TIMESTAMPADD(SECOND, nr.interval_seconds, nr.last_sent_at)
+		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))`,
+		RuleZoneBreach,
+		ProviderBark,
+		scheduleSlack.Microseconds(),
+	)
+	if err != nil {
+		s.logger.Error("query due zone breaches failed", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	var due []dueZoneBreachRule
+	for rows.Next() {
+		var item dueZoneBreachRule
+		if err := rows.Scan(&item.UserID, &item.SessionID, &item.SecretCiphertext); err != nil {
+			s.logger.Error("scan due zone breach failed", "error", err)
+			continue
+		}
+		due = append(due, item)
+	}
+	for _, item := range due {
+		s.sendZoneBreach(ctx, item, time.Now())
+	}
+}
+
+func (s *Service) sendZoneBreach(ctx context.Context, item dueZoneBreachRule, now time.Time) {
+	payload, online, ok := s.hub.LatestZone(item.SessionID)
+	if !ok || !online || !zoneBreachActive(payload, now) {
+		return
+	}
+	if _, err := s.db.ExecContext(
+		ctx,
+		`UPDATE notification_rules SET last_sent_at = NOW(3)
+		 WHERE user_id = ? AND rule_key = ? AND enabled = 1`,
+		item.UserID,
+		RuleZoneBreach,
+	); err != nil {
+		s.logger.Error("reserve zone breach schedule failed", "user_id", item.UserID, "error", err)
+		return
+	}
+	deviceKey, err := s.box.open(item.SecretCiphertext)
+	if err == nil {
+		err = s.bark.push(ctx, deviceKey, "角色已离开安全区，请尽快查看！", s.publicBaseURL)
+	}
+	s.recordDelivery(ctx, item.UserID, RuleZoneBreach, err)
+	if err != nil {
+		s.logger.Warn("send Bark zone breach failed", "user_id", item.UserID, "error", err)
+	}
+}
+
+// zoneBreachActive 判断上报的安全区状态是否既处于「已越界」又足够新鲜。
+func zoneBreachActive(payload protocol.ZonePayload, now time.Time) bool {
+	if !payload.Outside {
+		return false
+	}
+	if payload.DetectedAt <= 0 {
+		return false
+	}
+	age := now.Sub(time.UnixMilli(payload.DetectedAt))
+	return age >= -ZoneBreachFreshnessWindow && age <= ZoneBreachFreshnessWindow
 }
 
 func (s *Service) recordDelivery(ctx context.Context, userID int64, eventType string, sendError error) {

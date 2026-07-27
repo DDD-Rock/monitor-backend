@@ -48,3 +48,8 @@ ALLOW_REGISTRATION=true
 - `GET /api/healthz`
 - `GET /ws/device?session_id=...`
 - `GET /ws/view?token=...`
+
+发布端支持 `map`、`frame`、`status`、`exp` 和 `rune` 五类消息。`exp` 包含当前
+EXP、经验百分比、识别置信度、状态与识别时间。`rune` 包含符文提示是否出现、
+识别置信度和识别时间，客户端在状态翻转时立刻上报，状态不变时每 3 秒心跳重发
+一次。两者都会进入查看端首次连接时的最新快照。

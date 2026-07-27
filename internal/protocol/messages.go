@@ -10,6 +10,8 @@ const (
 	TypeMap         = "map"
 	TypeFrame       = "frame"
 	TypeStatus      = "status"
+	TypeEXP         = "exp"
+	TypeRune        = "rune"
 	TypeSnapshot    = "snapshot"
 )
 
@@ -58,6 +60,22 @@ type StatusPayload struct {
 	Message string `json:"message"`
 }
 
+type EXPPayload struct {
+	CurrentEXP   *int64   `json:"currentEXP"`
+	Percent      *float64 `json:"percent"`
+	Confidence   *float64 `json:"confidence"`
+	Status       string   `json:"status"`
+	RecognizedAt int64    `json:"recognizedAt"`
+}
+
+// RunePayload 描述 Mac 端对「符文诅咒提示横幅」的识别结果。
+// Detected 为 true 表示画面上仍挂着紫色符文提示，需要尽快解除。
+type RunePayload struct {
+	Detected   bool     `json:"detected"`
+	Confidence *float64 `json:"confidence"`
+	DetectedAt int64    `json:"detectedAt"`
+}
+
 type Envelope struct {
 	Type     string          `json:"type"`
 	Sequence uint64          `json:"sequence"`
@@ -70,6 +88,8 @@ type Snapshot struct {
 	Map       json.RawMessage `json:"map,omitempty"`
 	Frame     json.RawMessage `json:"frame,omitempty"`
 	Status    json.RawMessage `json:"status,omitempty"`
+	EXP       json.RawMessage `json:"exp,omitempty"`
+	Rune      json.RawMessage `json:"rune,omitempty"`
 	UpdatedAt int64           `json:"updatedAt"`
 }
 
@@ -104,6 +124,34 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 		var payload StatusPayload
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			return Envelope{}, errors.New("invalid status payload")
+		}
+	case TypeEXP:
+		var payload EXPPayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return Envelope{}, errors.New("invalid EXP payload")
+		}
+		hasReading := payload.CurrentEXP != nil || payload.Percent != nil || payload.Confidence != nil
+		if hasReading && (payload.CurrentEXP == nil || payload.Percent == nil || payload.Confidence == nil) {
+			return Envelope{}, errors.New("incomplete EXP payload")
+		}
+		if payload.CurrentEXP != nil && (*payload.CurrentEXP < 0 ||
+			*payload.Percent < 0 || *payload.Percent > 100 ||
+			*payload.Confidence < 0 || *payload.Confidence > 1) {
+			return Envelope{}, errors.New("invalid EXP values")
+		}
+	case TypeRune:
+		var payload RunePayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return Envelope{}, errors.New("invalid rune payload")
+		}
+		if payload.DetectedAt <= 0 {
+			return Envelope{}, errors.New("invalid rune timestamp")
+		}
+		if payload.Confidence != nil && (*payload.Confidence < 0 || *payload.Confidence > 1) {
+			return Envelope{}, errors.New("invalid rune confidence")
+		}
+		if !payload.Detected && payload.Confidence != nil {
+			return Envelope{}, errors.New("cleared rune must not carry confidence")
 		}
 	default:
 		return Envelope{}, errors.New("unsupported message type")

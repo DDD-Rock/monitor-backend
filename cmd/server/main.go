@@ -13,6 +13,7 @@ import (
 	"autobuff-monitor/server/internal/auth"
 	"autobuff-monitor/server/internal/config"
 	"autobuff-monitor/server/internal/database"
+	"autobuff-monitor/server/internal/notification"
 	"autobuff-monitor/server/internal/realtime"
 )
 
@@ -34,7 +35,23 @@ func main() {
 
 	authService := auth.NewService([]byte(cfg.JWTSecret), cfg.JWTTTL)
 	hub := realtime.NewHub()
-	handler := api.NewServer(cfg, db, authService, hub, logger).Routes()
+	notificationService, err := notification.NewService(
+		db,
+		hub,
+		[]byte(cfg.JWTSecret),
+		cfg.BarkBaseURL,
+		cfg.BarkPublicURL,
+		cfg.PublicBaseURL,
+		logger,
+	)
+	if err != nil {
+		logger.Error("notification service initialization failed", "error", err)
+		os.Exit(1)
+	}
+	serviceContext, cancelServices := context.WithCancel(context.Background())
+	defer cancelServices()
+	notificationService.Start(serviceContext)
+	handler := api.NewServer(cfg, db, authService, hub, notificationService, logger).Routes()
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -55,6 +72,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	cancelServices()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hub.Close()

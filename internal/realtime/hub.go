@@ -15,6 +15,8 @@ type Room struct {
 	latestMap    json.RawMessage
 	latestFrame  json.RawMessage
 	latestStatus json.RawMessage
+	latestEXP    json.RawMessage
+	latestRune   json.RawMessage
 	online       bool
 	updatedAt    int64
 }
@@ -71,6 +73,10 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 		room.latestFrame = append(room.latestFrame[:0], envelope.Payload...)
 	case protocol.TypeStatus:
 		room.latestStatus = append(room.latestStatus[:0], envelope.Payload...)
+	case protocol.TypeEXP:
+		room.latestEXP = append(room.latestEXP[:0], envelope.Payload...)
+	case protocol.TypeRune:
+		room.latestRune = append(room.latestRune[:0], envelope.Payload...)
 	}
 	room.updatedAt = time.Now().UnixMilli()
 	room.mu.Unlock()
@@ -96,6 +102,49 @@ func (h *Hub) Subscribe(sessionID, viewerID string) (<-chan []byte, func()) {
 	}
 }
 
+func (h *Hub) LatestEXP(sessionID string) (protocol.EXPPayload, bool, bool) {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return protocol.EXPPayload{}, false, false
+	}
+	room.mu.RLock()
+	raw := append(json.RawMessage(nil), room.latestEXP...)
+	online := room.online
+	room.mu.RUnlock()
+	if len(raw) == 0 {
+		return protocol.EXPPayload{}, online, false
+	}
+	var payload protocol.EXPPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return protocol.EXPPayload{}, online, false
+	}
+	return payload, online, true
+}
+
+// LatestRune 返回会话最近一次上报的符文状态、发布端是否在线，以及是否有过上报。
+func (h *Hub) LatestRune(sessionID string) (protocol.RunePayload, bool, bool) {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return protocol.RunePayload{}, false, false
+	}
+	room.mu.RLock()
+	raw := append(json.RawMessage(nil), room.latestRune...)
+	online := room.online
+	room.mu.RUnlock()
+	if len(raw) == 0 {
+		return protocol.RunePayload{}, online, false
+	}
+	var payload protocol.RunePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return protocol.RunePayload{}, online, false
+	}
+	return payload, online, true
+}
+
 func (r *Room) snapshot() protocol.Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -105,6 +154,8 @@ func (r *Room) snapshot() protocol.Snapshot {
 		Map:       append(json.RawMessage(nil), r.latestMap...),
 		Frame:     append(json.RawMessage(nil), r.latestFrame...),
 		Status:    append(json.RawMessage(nil), r.latestStatus...),
+		EXP:       append(json.RawMessage(nil), r.latestEXP...),
+		Rune:      append(json.RawMessage(nil), r.latestRune...),
 		UpdatedAt: r.updatedAt,
 	}
 }

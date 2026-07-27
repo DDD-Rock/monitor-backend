@@ -18,6 +18,7 @@ import (
 
 	"autobuff-monitor/server/internal/auth"
 	"autobuff-monitor/server/internal/config"
+	"autobuff-monitor/server/internal/notification"
 	"autobuff-monitor/server/internal/protocol"
 	"autobuff-monitor/server/internal/realtime"
 
@@ -45,6 +46,7 @@ type Server struct {
 	db     *sql.DB
 	auth   *auth.Service
 	hub    *realtime.Hub
+	notify *notification.Service
 	logger *slog.Logger
 }
 
@@ -53,9 +55,10 @@ func NewServer(
 	db *sql.DB,
 	authService *auth.Service,
 	hub *realtime.Hub,
+	notificationService *notification.Service,
 	logger *slog.Logger,
 ) *Server {
-	return &Server{cfg: cfg, db: db, auth: authService, hub: hub, logger: logger}
+	return &Server{cfg: cfg, db: db, auth: authService, hub: hub, notify: notificationService, logger: logger}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -67,6 +70,14 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/monitor/sessions", s.requireAuth(http.HandlerFunc(s.handleCreateSession)))
 	mux.Handle("GET /api/monitor/sessions/current", s.requireAuth(http.HandlerFunc(s.handleCurrentSession)))
 	mux.Handle("DELETE /api/monitor/sessions/current", s.requireAuth(http.HandlerFunc(s.handleRevokeSession)))
+	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
+	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
+	mux.Handle("POST /api/notifications/bark/test", s.requireAuth(http.HandlerFunc(s.handleBarkTest)))
+	mux.HandleFunc("GET /api/preview/notifications/bark", s.handlePreviewBarkSettings)
+	mux.HandleFunc("PUT /api/preview/notifications/exp-minute", s.handlePreviewEXPMinute)
+	mux.HandleFunc("PUT /api/preview/notifications/exp-stalled", s.handlePreviewEXPStalled)
+	mux.HandleFunc("PUT /api/preview/notifications/rune-alert", s.handlePreviewRuneAlert)
+	mux.HandleFunc("POST /api/preview/notifications/bark/test", s.handlePreviewBarkTest)
 	mux.Handle("GET /ws/device", s.requireAuth(http.HandlerFunc(s.handleDeviceWebSocket)))
 	mux.HandleFunc("GET /ws/view", s.handleViewerWebSocket)
 	return s.recoverPanic(mux)
@@ -360,6 +371,7 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer connection.CloseNow()
+	connectionContext := connection.CloseRead(r.Context())
 
 	viewerID, _ := randomUUID()
 	messages, unsubscribe := s.hub.Subscribe(sessionID, viewerID)
@@ -373,20 +385,20 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(connectionContext, 5*time.Second)
 			err := connection.Write(ctx, websocket.MessageText, message)
 			cancel()
 			if err != nil {
 				return
 			}
 		case <-pingTicker.C:
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(connectionContext, 5*time.Second)
 			err := connection.Ping(ctx)
 			cancel()
 			if err != nil {
 				return
 			}
-		case <-r.Context().Done():
+		case <-connectionContext.Done():
 			return
 		}
 	}

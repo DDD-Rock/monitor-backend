@@ -16,6 +16,8 @@ type Config struct {
 	JWTSecret         string
 	JWTTTL            time.Duration
 	AllowRegistration bool
+	BarkBaseURL       string
+	BarkPublicURL     string
 }
 
 func Load() (Config, error) {
@@ -35,6 +37,8 @@ func Load() (Config, error) {
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		JWTTTL:            ttl,
 		AllowRegistration: allowRegistration,
+		BarkBaseURL:       strings.TrimRight(valueOrDefault("BARK_BASE_URL", "http://127.0.0.1:29687"), "/"),
+		BarkPublicURL:     strings.TrimRight(valueOrDefault("BARK_PUBLIC_URL", "http://106.52.208.129:29687"), "/"),
 	}
 
 	if cfg.DatabaseDSN == "" {
@@ -46,7 +50,14 @@ func Load() (Config, error) {
 	if !strings.HasPrefix(cfg.PublicBaseURL, "http://") && !strings.HasPrefix(cfg.PublicBaseURL, "https://") {
 		return Config{}, errors.New("PUBLIC_BASE_URL must start with http:// or https://")
 	}
+	if !validHTTPURL(cfg.BarkBaseURL) || !validHTTPURL(cfg.BarkPublicURL) {
+		return Config{}, errors.New("BARK_BASE_URL and BARK_PUBLIC_URL must start with http:// or https://")
+	}
 	return cfg, nil
+}
+
+func validHTTPURL(value string) bool {
+	return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
 }
 
 func valueOrDefault(key, fallback string) string {

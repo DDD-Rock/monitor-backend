@@ -13,7 +13,9 @@ const (
 	TypeEXP         = "exp"
 	TypeRune        = "rune"
 	TypeZone        = "zone"
-	TypeSnapshot    = "snapshot"
+	// TypeGain 由服务端根据 EXP 增量汇总后推给查看端，设备端不会上报这类消息。
+	TypeGain     = "gain"
+	TypeSnapshot = "snapshot"
 )
 
 // 归一化坐标允许的浮点误差。客户端由像素换算而来，边界上会有微小偏差。
@@ -110,6 +112,17 @@ type ZonePayload struct {
 	DetectedAt int64     `json:"detectedAt"`
 }
 
+// GainPayload 是服务端汇总后的经验获取量，极简模式会伪装成流量与资源包用量。
+// Inflow10m / Outflow1h 分别是最近 10 分钟、1 小时的正增量之和；
+// TotalUsage 跨多次启动累积，可手动清零；DailyUsage 按北京时间自然日累计，午夜清零。
+type GainPayload struct {
+	Inflow10m  int64 `json:"inflow10m"`
+	Outflow1h  int64 `json:"outflow1h"`
+	TotalUsage int64 `json:"totalUsage"`
+	DailyUsage int64 `json:"dailyUsage"`
+	SampledAt  int64 `json:"sampledAt"`
+}
+
 type Envelope struct {
 	Type     string          `json:"type"`
 	Sequence uint64          `json:"sequence"`
@@ -125,6 +138,7 @@ type Snapshot struct {
 	EXP       json.RawMessage `json:"exp,omitempty"`
 	Rune      json.RawMessage `json:"rune,omitempty"`
 	Zone      json.RawMessage `json:"zone,omitempty"`
+	Gain      json.RawMessage `json:"gain,omitempty"`
 	UpdatedAt int64           `json:"updatedAt"`
 }
 

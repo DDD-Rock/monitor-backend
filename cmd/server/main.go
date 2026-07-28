@@ -13,6 +13,7 @@ import (
 	"autobuff-monitor/server/internal/auth"
 	"autobuff-monitor/server/internal/config"
 	"autobuff-monitor/server/internal/database"
+	"autobuff-monitor/server/internal/expgain"
 	"autobuff-monitor/server/internal/notification"
 	"autobuff-monitor/server/internal/realtime"
 )
@@ -48,10 +49,16 @@ func main() {
 		logger.Error("notification service initialization failed", "error", err)
 		os.Exit(1)
 	}
+	expGainService, err := expgain.NewService(db, hub, logger)
+	if err != nil {
+		logger.Error("exp gain service initialization failed", "error", err)
+		os.Exit(1)
+	}
 	serviceContext, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
 	notificationService.Start(serviceContext)
-	handler := api.NewServer(cfg, db, authService, hub, notificationService, logger).Routes()
+	expGainService.Start(serviceContext)
+	handler := api.NewServer(cfg, db, authService, hub, notificationService, expGainService, logger).Routes()
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,

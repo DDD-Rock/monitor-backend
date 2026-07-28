@@ -52,12 +52,20 @@ ALLOW_REGISTRATION=true
 - `PUT /api/preview/notifications/exp-stalled`
 - `PUT /api/preview/notifications/rune-alert`
 - `PUT /api/preview/notifications/zone-breach`
+- `GET /api/preview/exp-gain`
+- `POST /api/preview/exp-gain/reset-total`
 
 发布端支持 `map`、`frame`、`status`、`exp`、`rune` 和 `zone` 六类消息。`exp`
 包含当前 EXP、经验百分比、识别置信度、状态与识别时间。`rune` 包含符文提示是否
 出现、识别置信度和识别时间。`zone` 包含角色是否离开安全区，以及归一化的安全区
 矩形（左上角原点，`x/y/width/height` 都在 0~1，网页据此画框）；矩形为空表示
 本机没有配置安全区。
+
+服务端还会根据 EXP 正增量汇总 `gain` 消息（设备端不能伪造）：
+`inflow10m`（近 10 分钟）、`outflow1h`（近 1 小时）、`totalUsage`（跨启动总累计，
+可手动清零）、`dailyUsage`（北京时间当日累计，每天 0 点清零）。累计与近 1 小时
+采样每 15 秒落库，进程退出前也会再刷一次。升级已有库时执行根目录
+`exp_gain_migration.sql`。
 
 `rune` 和 `zone` 都在状态翻转时立刻上报，状态不变时每 3 秒心跳重发一次，
 服务端据此判断数据是否新鲜。所有消息都会进入查看端首次连接时的最新快照。

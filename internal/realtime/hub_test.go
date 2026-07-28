@@ -232,3 +232,55 @@ func TestSnapshotIncludesLatestZone(t *testing.T) {
 		t.Fatal("timed out waiting for snapshot")
 	}
 }
+
+func TestPublishGainUpdatesSnapshotAndBroadcast(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	channel, unsubscribe := hub.Subscribe("session-1", "viewer-1")
+	defer unsubscribe()
+	<-channel
+
+	gain := protocol.GainPayload{
+		Inflow10m:  10,
+		Outflow1h:  60,
+		TotalUsage: 1000,
+		DailyUsage: 200,
+		SampledAt:  1769000000000,
+	}
+	if err := hub.PublishGain("session-1", gain); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case message := <-channel:
+		var envelope protocol.Envelope
+		if err := json.Unmarshal(message, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Type != protocol.TypeGain {
+			t.Fatalf("expected gain, got %s", envelope.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for gain broadcast")
+	}
+
+	channel2, unsubscribe2 := hub.Subscribe("session-1", "viewer-2")
+	defer unsubscribe2()
+	select {
+	case message := <-channel2:
+		var snapshot protocol.Snapshot
+		if err := json.Unmarshal(message, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		var stored protocol.GainPayload
+		if err := json.Unmarshal(snapshot.Gain, &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != gain {
+			t.Fatalf("snapshot gain = %#v, want %#v", stored, gain)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for snapshot with gain")
+	}
+}

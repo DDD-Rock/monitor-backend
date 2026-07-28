@@ -18,6 +18,7 @@ import (
 
 	"autobuff-monitor/server/internal/auth"
 	"autobuff-monitor/server/internal/config"
+	"autobuff-monitor/server/internal/expgain"
 	"autobuff-monitor/server/internal/notification"
 	"autobuff-monitor/server/internal/protocol"
 	"autobuff-monitor/server/internal/realtime"
@@ -42,12 +43,13 @@ type authenticatedUser struct {
 }
 
 type Server struct {
-	cfg    config.Config
-	db     *sql.DB
-	auth   *auth.Service
-	hub    *realtime.Hub
-	notify *notification.Service
-	logger *slog.Logger
+	cfg     config.Config
+	db      *sql.DB
+	auth    *auth.Service
+	hub     *realtime.Hub
+	notify  *notification.Service
+	expGain *expgain.Service
+	logger  *slog.Logger
 }
 
 func NewServer(
@@ -56,9 +58,18 @@ func NewServer(
 	authService *auth.Service,
 	hub *realtime.Hub,
 	notificationService *notification.Service,
+	expGainService *expgain.Service,
 	logger *slog.Logger,
 ) *Server {
-	return &Server{cfg: cfg, db: db, auth: authService, hub: hub, notify: notificationService, logger: logger}
+	return &Server{
+		cfg:     cfg,
+		db:      db,
+		auth:    authService,
+		hub:     hub,
+		notify:  notificationService,
+		expGain: expGainService,
+		logger:  logger,
+	}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -78,6 +89,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/preview/notifications/rune-alert", s.handlePreviewRuneAlert)
 	mux.HandleFunc("PUT /api/preview/notifications/zone-breach", s.handlePreviewZoneBreach)
 	mux.HandleFunc("POST /api/preview/notifications/bark/test", s.handlePreviewBarkTest)
+	mux.HandleFunc("GET /api/preview/exp-gain", s.handlePreviewEXPGain)
+	mux.HandleFunc("POST /api/preview/exp-gain/reset-total", s.handlePreviewResetEXPGainTotal)
 	mux.Handle("GET /ws/device", s.requireAuth(http.HandlerFunc(s.handleDeviceWebSocket)))
 	mux.HandleFunc("GET /ws/view", s.handleViewerWebSocket)
 	return s.recoverPanic(mux)

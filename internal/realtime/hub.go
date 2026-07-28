@@ -18,6 +18,7 @@ type Room struct {
 	latestEXP    json.RawMessage
 	latestRune   json.RawMessage
 	latestZone   json.RawMessage
+	latestGain   json.RawMessage
 	online       bool
 	updatedAt    int64
 }
@@ -80,10 +81,28 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 		room.latestRune = append(room.latestRune[:0], envelope.Payload...)
 	case protocol.TypeZone:
 		room.latestZone = append(room.latestZone[:0], envelope.Payload...)
+	case protocol.TypeGain:
+		room.latestGain = append(room.latestGain[:0], envelope.Payload...)
 	}
 	room.updatedAt = time.Now().UnixMilli()
 	room.mu.Unlock()
 	room.broadcast(raw)
+}
+
+// PublishGain 由服务端写入经验累计快照并广播给查看端。
+// 设备端不会走这条路径；ValidateEnvelope 也故意不接受 gain，防止客户端伪造。
+func (h *Hub) PublishGain(sessionID string, payload protocol.GainPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	envelope := protocol.Envelope{Type: protocol.TypeGain, Payload: body}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	h.Publish(sessionID, envelope, raw)
+	return nil
 }
 
 func (h *Hub) Subscribe(sessionID, viewerID string) (<-chan []byte, func()) {
@@ -182,6 +201,7 @@ func (r *Room) snapshot() protocol.Snapshot {
 		EXP:       append(json.RawMessage(nil), r.latestEXP...),
 		Rune:      append(json.RawMessage(nil), r.latestRune...),
 		Zone:      append(json.RawMessage(nil), r.latestZone...),
+		Gain:      append(json.RawMessage(nil), r.latestGain...),
 		UpdatedAt: r.updatedAt,
 	}
 }

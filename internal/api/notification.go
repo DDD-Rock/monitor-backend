@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type saveBarkRequest struct {
@@ -209,4 +210,33 @@ func (s *Server) previewUserID(w http.ResponseWriter, r *http.Request) (int64, b
 		return 0, false
 	}
 	return userID, true
+}
+
+func (s *Server) handlePreviewEXPGain(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.previewUserID(w, r)
+	if !ok {
+		return
+	}
+	if s.expGain == nil {
+		writeError(w, http.StatusServiceUnavailable, "exp_gain_unavailable", "经验累计服务未就绪")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.expGain.Snapshot(userID, time.Now()))
+}
+
+func (s *Server) handlePreviewResetEXPGainTotal(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.previewUserID(w, r)
+	if !ok {
+		return
+	}
+	if s.expGain == nil {
+		writeError(w, http.StatusServiceUnavailable, "exp_gain_unavailable", "经验累计服务未就绪")
+		return
+	}
+	payload, err := s.expGain.ResetTotal(r.Context(), userID)
+	if err != nil {
+		s.internalError(w, "reset exp gain total failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }

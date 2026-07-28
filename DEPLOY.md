@@ -28,6 +28,17 @@ sudo systemctl restart autobuff-monitor
 sudo journalctl -u autobuff-monitor -f
 ```
 
+## 数据库增量
+
+经验累计落库需要先建表（只需执行一次）：
+
+```bash
+# 在能连上生产 MySQL 的机器上执行工作区根目录的
+# exp_gain_migration.sql
+```
+
+未建表时 Go 服务启动会因加载累计数据失败而退出。
+
 ## 升级步骤
 
 `/opt/autobuff-monitor/backend/.env` 是生产配置且不在版本控制里，同步源码时

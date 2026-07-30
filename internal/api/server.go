@@ -3,9 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -78,19 +76,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.Handle("GET /api/auth/me", s.requireAuth(http.HandlerFunc(s.handleMe)))
-	mux.Handle("POST /api/monitor/sessions", s.requireAuth(http.HandlerFunc(s.handleCreateSession)))
-	mux.Handle("GET /api/monitor/sessions/current", s.requireAuth(http.HandlerFunc(s.handleCurrentSession)))
-	mux.Handle("DELETE /api/monitor/sessions/current", s.requireAuth(http.HandlerFunc(s.handleRevokeSession)))
 	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
 	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
 	mux.Handle("POST /api/notifications/bark/test", s.requireAuth(http.HandlerFunc(s.handleBarkTest)))
-	mux.HandleFunc("GET /api/preview/notifications/bark", s.handlePreviewBarkSettings)
-	mux.HandleFunc("PUT /api/preview/notifications/exp-stalled", s.handlePreviewEXPStalled)
-	mux.HandleFunc("PUT /api/preview/notifications/rune-alert", s.handlePreviewRuneAlert)
-	mux.HandleFunc("PUT /api/preview/notifications/zone-breach", s.handlePreviewZoneBreach)
-	mux.HandleFunc("POST /api/preview/notifications/bark/test", s.handlePreviewBarkTest)
-	mux.HandleFunc("GET /api/preview/exp-gain", s.handlePreviewEXPGain)
-	mux.HandleFunc("POST /api/preview/exp-gain/reset-total", s.handlePreviewResetEXPGainTotal)
+	mux.Handle("PUT /api/notifications/exp-stalled", s.requireAuth(http.HandlerFunc(s.handleEXPStalled)))
+	mux.Handle("PUT /api/notifications/rune-alert", s.requireAuth(http.HandlerFunc(s.handleRuneAlert)))
+	mux.Handle("PUT /api/notifications/zone-breach", s.requireAuth(http.HandlerFunc(s.handleZoneBreach)))
+	mux.Handle("GET /api/monitor/exp-gain", s.requireAuth(http.HandlerFunc(s.handleEXPGain)))
+	mux.Handle("POST /api/monitor/exp-gain/reset-total", s.requireAuth(http.HandlerFunc(s.handleResetEXPGainTotal)))
 	mux.Handle("GET /ws/device", s.requireAuth(http.HandlerFunc(s.handleDeviceWebSocket)))
 	mux.HandleFunc("GET /ws/view", s.handleViewerWebSocket)
 	return s.recoverPanic(mux)
@@ -209,130 +202,65 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type createSessionRequest struct {
-	Name string `json:"name"`
-}
-
-func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	user := mustUser(r.Context())
-	var request createSessionRequest
-	if !decodeJSON(w, r, &request) {
-		return
-	}
-	request.Name = strings.TrimSpace(request.Name)
-	if request.Name == "" {
-		request.Name = "我的电脑"
-	}
-	if len([]rune(request.Name)) > 64 {
-		writeError(w, http.StatusBadRequest, "invalid_name", "设备名称不能超过 64 个字符")
-		return
-	}
-
-	sessionID, err := randomUUID()
+func (s *Server) ensureActiveSession(ctx context.Context, userID int64) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		s.internalError(w, "generate session id failed", err)
-		return
+		return "", err
 	}
-	previewToken, previewHash, err := randomPreviewToken()
-	if err != nil {
-		s.internalError(w, "generate preview token failed", err)
-		return
+	defer func() { _ = tx.Rollback() }()
+
+	// 锁定账号行，将同一账号首次连接时的“查询并创建”串行化。
+	// 这样无需给历史 monitor_sessions 表增加生成列或唯一索引。
+	var lockedUserID int64
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT id FROM users WHERE id = ? FOR UPDATE`,
+		userID,
+	).Scan(&lockedUserID); err != nil {
+		return "", err
 	}
 
-	tx, err := s.db.BeginTx(r.Context(), nil)
+	var sessionID string
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT id FROM monitor_sessions WHERE user_id = ? AND status = 1 ORDER BY created_at DESC LIMIT 1`,
+		userID,
+	).Scan(&sessionID)
+	if err == nil {
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return sessionID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	sessionID, err = randomUUID()
 	if err != nil {
-		s.internalError(w, "start session transaction failed", err)
-		return
+		return "", err
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(
-		r.Context(),
-		`UPDATE monitor_sessions SET status = 0, revoked_at = NOW(3) WHERE user_id = ? AND status = 1`,
-		user.ID,
-	); err != nil {
-		s.internalError(w, "revoke previous session failed", err)
-		return
-	}
-	if _, err := tx.ExecContext(
-		r.Context(),
-		`INSERT INTO monitor_sessions (id, user_id, name, preview_token_hash) VALUES (?, ?, ?, ?)`,
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO monitor_sessions (id, user_id, name)
+		 VALUES (?, ?, '账号监控')`,
 		sessionID,
-		user.ID,
-		request.Name,
-		previewHash[:],
-	); err != nil {
-		s.internalError(w, "create monitor session failed", err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		s.internalError(w, "commit monitor session failed", err)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":           sessionID,
-		"name":         request.Name,
-		"previewToken": previewToken,
-		"previewURL":   s.cfg.PublicBaseURL + "/preview/" + previewToken,
-		"publishURL":   websocketURL(s.cfg.PublicBaseURL) + "/ws/device?session_id=" + sessionID,
-	})
-}
-
-func (s *Server) handleCurrentSession(w http.ResponseWriter, r *http.Request) {
-	user := mustUser(r.Context())
-	var sessionID, name string
-	var createdAt time.Time
-	err := s.db.QueryRowContext(
-		r.Context(),
-		`SELECT id, name, created_at FROM monitor_sessions WHERE user_id = ? AND status = 1 ORDER BY created_at DESC LIMIT 1`,
-		user.ID,
-	).Scan(&sessionID, &name, &createdAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeJSON(w, http.StatusOK, map[string]any{"session": nil})
-		return
-	}
-	if err != nil {
-		s.internalError(w, "query monitor session failed", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session": map[string]any{
-			"id":        sessionID,
-			"name":      name,
-			"createdAt": createdAt.UnixMilli(),
-		},
-	})
-}
-
-func (s *Server) handleRevokeSession(w http.ResponseWriter, r *http.Request) {
-	user := mustUser(r.Context())
-	_, err := s.db.ExecContext(
-		r.Context(),
-		`UPDATE monitor_sessions SET status = 0, revoked_at = NOW(3) WHERE user_id = ? AND status = 1`,
-		user.ID,
+		userID,
 	)
 	if err != nil {
-		s.internalError(w, "revoke monitor session failed", err)
-		return
+		return "", err
 	}
-	w.WriteHeader(http.StatusNoContent)
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return sessionID, nil
 }
 
 func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
-	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
-	if sessionID == "" {
-		writeError(w, http.StatusBadRequest, "missing_session", "缺少监控会话")
-		return
-	}
-	var exists int
-	if err := s.db.QueryRowContext(
-		r.Context(),
-		`SELECT 1 FROM monitor_sessions WHERE id = ? AND user_id = ? AND status = 1`,
-		sessionID,
-		user.ID,
-	).Scan(&exists); err != nil {
-		writeError(w, http.StatusForbidden, "invalid_session", "监控会话无效")
+	sessionID, err := s.ensureActiveSession(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "ensure publisher channel failed", err)
 		return
 	}
 
@@ -363,19 +291,14 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
-	rawToken := strings.TrimSpace(r.URL.Query().Get("token"))
-	if rawToken == "" {
-		writeError(w, http.StatusUnauthorized, "missing_preview_token", "预览链接无效")
+	rawToken := strings.TrimSpace(r.URL.Query().Get("access_token"))
+	user, ok := s.authenticateToken(w, r, rawToken)
+	if !ok {
 		return
 	}
-	tokenHash := sha256.Sum256([]byte(rawToken))
-	var sessionID string
-	if err := s.db.QueryRowContext(
-		r.Context(),
-		`SELECT id FROM monitor_sessions WHERE preview_token_hash = ? AND status = 1 LIMIT 1`,
-		tokenHash[:],
-	).Scan(&sessionID); err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid_preview_token", "预览链接无效或已失效")
+	sessionID, err := s.ensureActiveSession(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "ensure viewer channel failed", err)
 		return
 	}
 
@@ -420,33 +343,41 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		if raw == "" {
-			writeError(w, http.StatusUnauthorized, "missing_token", "请先登录")
+		user, ok := s.authenticateToken(w, r, raw)
+		if !ok {
 			return
-		}
-		userID, username, err := s.auth.Parse(raw)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, "invalid_token", "登录已失效，请重新登录")
-			return
-		}
-		var activeUsername string
-		if err := s.db.QueryRowContext(
-			r.Context(),
-			`SELECT username FROM users WHERE id = ? AND status = 1 LIMIT 1`,
-			userID,
-		).Scan(&activeUsername); err != nil {
-			writeError(w, http.StatusUnauthorized, "account_disabled", "账号不可用，请重新登录")
-			return
-		}
-		if activeUsername != "" {
-			username = activeUsername
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(
 			r.Context(),
 			userContextKey,
-			authenticatedUser{ID: userID, Username: username},
+			user,
 		)))
 	})
+}
+
+func (s *Server) authenticateToken(w http.ResponseWriter, r *http.Request, raw string) (authenticatedUser, bool) {
+	if raw == "" {
+		writeError(w, http.StatusUnauthorized, "missing_token", "请先登录")
+		return authenticatedUser{}, false
+	}
+	userID, username, err := s.auth.Parse(raw)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid_token", "登录已失效，请重新登录")
+		return authenticatedUser{}, false
+	}
+	var activeUsername string
+	if err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT username FROM users WHERE id = ? AND status = 1 LIMIT 1`,
+		userID,
+	).Scan(&activeUsername); err != nil {
+		writeError(w, http.StatusUnauthorized, "account_disabled", "账号不可用，请重新登录")
+		return authenticatedUser{}, false
+	}
+	if activeUsername != "" {
+		username = activeUsername
+	}
+	return authenticatedUser{ID: userID, Username: username}, true
 }
 
 func mustUser(ctx context.Context) authenticatedUser {
@@ -494,15 +425,6 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	})
 }
 
-func randomPreviewToken() (string, [32]byte, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", [32]byte{}, err
-	}
-	token := base64.RawURLEncoding.EncodeToString(bytes)
-	return token, sha256.Sum256([]byte(token)), nil
-}
-
 func randomUUID() (string, error) {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -512,11 +434,4 @@ func randomUUID() (string, error) {
 	bytes[8] = (bytes[8] & 0x3f) | 0x80
 	encoded := hex.EncodeToString(bytes)
 	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
-}
-
-func websocketURL(publicBaseURL string) string {
-	if strings.HasPrefix(publicBaseURL, "https://") {
-		return "wss://" + strings.TrimPrefix(publicBaseURL, "https://")
-	}
-	return "ws://" + strings.TrimPrefix(publicBaseURL, "http://")
 }

@@ -11,7 +11,7 @@ import (
 	"autobuff-monitor/server/internal/config"
 )
 
-func TestPreviewNotificationRoutesAreRegistered(t *testing.T) {
+func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 	t.Parallel()
 
 	server := NewServer(
@@ -25,18 +25,18 @@ func TestPreviewNotificationRoutesAreRegistered(t *testing.T) {
 	)
 	routes := server.Routes()
 
-	// 没带预览 token 时应在触碰数据库之前就返回 401；
-	// 如果路由没注册，得到的会是 404。
+	// 没有账号登录令牌时应在触碰数据库之前返回 401；
+	// 如果路由没有注册，得到的会是 404。
 	for _, item := range []struct {
 		method string
 		path   string
 		body   string
 	}{
-		{http.MethodPut, "/api/preview/notifications/exp-stalled", `{"enabled":true}`},
-		{http.MethodPut, "/api/preview/notifications/rune-alert", `{"enabled":true}`},
-		{http.MethodPut, "/api/preview/notifications/zone-breach", `{"enabled":true}`},
-		{http.MethodGet, "/api/preview/exp-gain", ""},
-		{http.MethodPost, "/api/preview/exp-gain/reset-total", ""},
+		{http.MethodPut, "/api/notifications/exp-stalled", `{"enabled":true}`},
+		{http.MethodPut, "/api/notifications/rune-alert", `{"enabled":true}`},
+		{http.MethodPut, "/api/notifications/zone-breach", `{"enabled":true}`},
+		{http.MethodGet, "/api/monitor/exp-gain", ""},
+		{http.MethodPost, "/api/monitor/exp-gain/reset-total", ""},
 	} {
 		request := httptest.NewRequest(item.method, item.path, strings.NewReader(item.body))
 		recorder := httptest.NewRecorder()
@@ -69,6 +69,30 @@ func TestRemovedEXPMinuteRouteIsGone(t *testing.T) {
 	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("每分钟经验推送已下线，应返回 404，实际 %d", recorder.Code)
+	}
+}
+
+func TestPreviewTokenRoutesAreGone(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(
+		config.Config{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/preview/notifications/bark?token=legacy",
+		nil,
+	)
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("旧预览 Key 接口应返回 404，实际 %d", recorder.Code)
 	}
 }
 

@@ -1,8 +1,12 @@
 package expgain
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
+
+	"autobuff-monitor/server/internal/protocol"
+	"autobuff-monitor/server/internal/realtime"
 )
 
 func TestSumWindow(t *testing.T) {
@@ -18,6 +22,53 @@ func TestSumWindow(t *testing.T) {
 	}
 	if got := sumWindow(samples, now, window1h); got != 150 {
 		t.Fatalf("1h window = %d, want 150", got)
+	}
+}
+
+func TestMultipleSessionsKeepIndependentEXPBaselines(t *testing.T) {
+	hub := realtime.NewHub()
+	defer hub.Close()
+	service := &Service{hub: hub}
+	state := &userState{sessionEXP: make(map[string]int64)}
+	now := time.Now()
+
+	publishEXP := func(sessionID string, value int64) {
+		payload, _ := json.Marshal(protocol.EXPPayload{CurrentEXP: &value})
+		hub.Publish(sessionID, protocol.Envelope{Type: protocol.TypeEXP, Payload: payload}, nil)
+	}
+	connect := func(sessionID string) func() {
+		_, detach := hub.AttachDevice(sessionID, 1, sessionID+"-publisher")
+		statePayload := json.RawMessage(`{"mode":"monitor","running":true}`)
+		hub.Publish(sessionID, protocol.Envelope{
+			Type:    protocol.TypeClientState,
+			Payload: statePayload,
+		}, nil)
+		return detach
+	}
+
+	detach1 := connect("session-1")
+	defer detach1()
+	detach2 := connect("session-2")
+	defer detach2()
+
+	publishEXP("session-1", 100)
+	publishEXP("session-2", 500)
+	service.sampleSessionLocked(state, "session-1", now)
+	service.sampleSessionLocked(state, "session-2", now)
+
+	publishEXP("session-1", 130)
+	publishEXP("session-2", 560)
+	service.sampleSessionLocked(state, "session-1", now.Add(5*time.Second))
+	service.sampleSessionLocked(state, "session-2", now.Add(5*time.Second))
+
+	if state.totalGained != 90 {
+		t.Fatalf("total gained = %d, want 90", state.totalGained)
+	}
+	if state.dailyGained != 90 {
+		t.Fatalf("daily gained = %d, want 90", state.dailyGained)
+	}
+	if len(state.samples) != 2 {
+		t.Fatalf("sample count = %d, want 2", len(state.samples))
 	}
 }
 

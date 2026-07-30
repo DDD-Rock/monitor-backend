@@ -32,6 +32,7 @@ type userState struct {
 	dailyDate      time.Time // 日历日零点（上海时区）
 	lastCurrentEXP *int64
 	sessionID      string
+	sessionEXP     map[string]int64
 	samples        []sample
 	dirty          bool
 	lastPayload    protocol.GainPayload
@@ -138,23 +139,31 @@ func (s *Service) tick(ctx context.Context, now time.Time) {
 		payload   protocol.GainPayload
 	}
 	var broadcasts []touched
+	sessionsByUser := make(map[int64][]string)
+	for _, session := range sessions {
+		sessionsByUser[session.UserID] = append(sessionsByUser[session.UserID], session.SessionID)
+	}
 
 	s.mu.Lock()
-	for _, session := range sessions {
-		state := s.ensureStateLocked(session.UserID, now)
+	for userID, sessionIDs := range sessionsByUser {
+		state := s.ensureStateLocked(userID, now)
 		s.rollDailyLocked(state, now)
-		s.sampleSessionLocked(state, session.SessionID, now)
+		for _, sessionID := range sessionIDs {
+			s.sampleSessionLocked(state, sessionID, now)
+		}
 		s.pruneSamplesLocked(state, now)
 		payload := s.payloadLocked(state, now)
 		// SampledAt 每次都会变，比较时忽略它，避免无变化时每 5 秒刷屏。
 		if !state.hasPayload || !sameGainValues(payload, state.lastPayload) {
 			state.lastPayload = payload
 			state.hasPayload = true
-			broadcasts = append(broadcasts, touched{
-				userID:    session.UserID,
-				sessionID: session.SessionID,
-				payload:   payload,
-			})
+			for _, sessionID := range sessionIDs {
+				broadcasts = append(broadcasts, touched{
+					userID:    userID,
+					sessionID: sessionID,
+					payload:   payload,
+				})
+			}
 		}
 	}
 
@@ -182,7 +191,11 @@ type activeSession struct {
 func (s *Service) activeSessions(ctx context.Context) ([]activeSession, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT user_id, id FROM monitor_sessions WHERE status = 1`,
+		`SELECT user_id, id FROM monitor_sessions
+		 WHERE status = 1
+		   AND client_id IS NOT NULL
+		   AND mode = 'monitor'
+		   AND running = 1`,
 	)
 	if err != nil {
 		return nil, err
@@ -201,29 +214,25 @@ func (s *Service) activeSessions(ctx context.Context) ([]activeSession, error) {
 }
 
 func (s *Service) sampleSessionLocked(state *userState, sessionID string, now time.Time) {
-	if state.sessionID != sessionID {
-		// 会话重建后重新建基准，避免把「新旧会话读数差」算成一次巨大获取。
-		state.sessionID = sessionID
-		state.lastCurrentEXP = nil
-		state.dirty = true
-	}
-
 	exp, online, ok := s.hub.LatestEXP(sessionID)
 	if !ok || !online || exp.CurrentEXP == nil {
 		// 读不到经验时清掉基准，与前端写入速率、服务端停滞逻辑一致。
-		state.lastCurrentEXP = nil
+		delete(state.sessionEXP, sessionID)
 		return
 	}
 
 	current := *exp.CurrentEXP
-	previous := state.lastCurrentEXP
+	previous, hasPrevious := state.sessionEXP[sessionID]
+	state.sessionEXP[sessionID] = current
+	// 继续写旧字段，保持现有数据库兼容；真正的多客户端基准保存在 sessionEXP。
+	state.sessionID = sessionID
 	state.lastCurrentEXP = &current
-	if previous == nil {
+	if !hasPrevious {
 		state.dirty = true
 		return
 	}
 
-	delta := current - *previous
+	delta := current - previous
 	if delta <= 0 {
 		// 升级或误识别导致回落时，负增量归零，不减少累计。
 		return
@@ -241,7 +250,8 @@ func (s *Service) ensureStateLocked(userID int64, now time.Time) *userState {
 		return state
 	}
 	state = &userState{
-		dailyDate: calendarDate(now, s.loc),
+		dailyDate:  calendarDate(now, s.loc),
+		sessionEXP: make(map[string]int64),
 	}
 	s.states[userID] = state
 	return state
@@ -329,6 +339,7 @@ func (s *Service) loadFromDB(ctx context.Context) error {
 			totalGained: totalGained,
 			dailyGained: dailyGained,
 			dailyDate:   calendarDate(dailyDate, s.loc),
+			sessionEXP:  make(map[string]int64),
 		}
 		if lastCurrentEXP.Valid {
 			value := lastCurrentEXP.Int64
@@ -336,6 +347,9 @@ func (s *Service) loadFromDB(ctx context.Context) error {
 		}
 		if sessionID.Valid {
 			state.sessionID = sessionID.String
+			if lastCurrentEXP.Valid {
+				state.sessionEXP[sessionID.String] = lastCurrentEXP.Int64
+			}
 		}
 		s.rollDailyLocked(state, now)
 		s.states[userID] = state

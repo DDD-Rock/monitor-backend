@@ -322,9 +322,14 @@ func (s *Service) processEXPStalls(ctx context.Context) {
 		`SELECT nr.user_id, ms.id, nc.secret_ciphertext, nr.interval_seconds
 		 FROM notification_rules nr
 		 JOIN notification_channels nc ON nc.user_id = nr.user_id
-		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id AND ms.status = 1
+		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id
+		   AND ms.status = 1
+		   AND ms.client_id IS NOT NULL
+		   AND ms.mode = 'monitor'
+		   AND ms.running = 1
 		 WHERE nr.rule_key = ? AND nr.enabled = 1
-		   AND nc.provider = ? AND nc.enabled = 1`,
+		   AND nc.provider = ? AND nc.enabled = 1
+		 ORDER BY nr.user_id, ms.last_publish_at DESC, ms.created_at DESC`,
 		RuleEXPStalled,
 		ProviderBark,
 	)
@@ -334,13 +339,39 @@ func (s *Service) processEXPStalls(ctx context.Context) {
 	}
 	defer rows.Close()
 
+	var rules []stalledEXPRule
 	for rows.Next() {
 		var rule stalledEXPRule
 		if err := rows.Scan(&rule.UserID, &rule.SessionID, &rule.SecretCiphertext, &rule.ThresholdSeconds); err != nil {
 			s.logger.Error("scan EXP stalled rule failed", "error", err)
 			continue
 		}
+		rules = append(rules, rule)
+	}
+
+	handled := make(map[int64]bool)
+	for _, rule := range rules {
+		if handled[rule.UserID] {
+			continue
+		}
+		exp, online, ok := s.hub.LatestEXP(rule.SessionID)
+		if !ok || !online || exp.CurrentEXP == nil || exp.Percent == nil {
+			continue
+		}
+		handled[rule.UserID] = true
 		s.evaluateEXPStall(ctx, rule, time.Now())
+	}
+	for _, rule := range rules {
+		if handled[rule.UserID] {
+			continue
+		}
+		handled[rule.UserID] = true
+		_, _ = s.db.ExecContext(
+			ctx,
+			`DELETE FROM notification_rule_states WHERE user_id = ? AND rule_key = ?`,
+			rule.UserID,
+			RuleEXPStalled,
+		)
 	}
 }
 
@@ -493,12 +524,17 @@ func (s *Service) processDueRuneAlerts(ctx context.Context) {
 		`SELECT nr.user_id, ms.id, nc.secret_ciphertext
 		 FROM notification_rules nr
 		 JOIN notification_channels nc ON nc.user_id = nr.user_id
-		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id AND ms.status = 1
+		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id
+		   AND ms.status = 1
+		   AND ms.client_id IS NOT NULL
+		   AND ms.mode = 'monitor'
+		   AND ms.running = 1
 		 WHERE nr.rule_key = ? AND nr.enabled = 1
 		   AND nc.provider = ? AND nc.enabled = 1
 		   AND (nr.last_sent_at IS NULL
 		        OR TIMESTAMPADD(SECOND, nr.interval_seconds, nr.last_sent_at)
-		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))`,
+		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))
+		 ORDER BY nr.user_id, ms.last_publish_at DESC, ms.created_at DESC`,
 		RuleRuneAlert,
 		ProviderBark,
 		scheduleSlack.Microseconds(),
@@ -518,7 +554,16 @@ func (s *Service) processDueRuneAlerts(ctx context.Context) {
 		}
 		due = append(due, item)
 	}
+	sentUsers := make(map[int64]bool)
 	for _, item := range due {
+		if sentUsers[item.UserID] {
+			continue
+		}
+		payload, online, ok := s.hub.LatestRune(item.SessionID)
+		if !ok || !online || !runeAlertActive(payload, time.Now()) {
+			continue
+		}
+		sentUsers[item.UserID] = true
 		s.sendRuneAlert(ctx, item, time.Now())
 	}
 }
@@ -574,12 +619,17 @@ func (s *Service) processDueZoneBreaches(ctx context.Context) {
 		`SELECT nr.user_id, ms.id, nc.secret_ciphertext
 		 FROM notification_rules nr
 		 JOIN notification_channels nc ON nc.user_id = nr.user_id
-		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id AND ms.status = 1
+		 JOIN monitor_sessions ms ON ms.user_id = nr.user_id
+		   AND ms.status = 1
+		   AND ms.client_id IS NOT NULL
+		   AND ms.mode = 'monitor'
+		   AND ms.running = 1
 		 WHERE nr.rule_key = ? AND nr.enabled = 1
 		   AND nc.provider = ? AND nc.enabled = 1
 		   AND (nr.last_sent_at IS NULL
 		        OR TIMESTAMPADD(SECOND, nr.interval_seconds, nr.last_sent_at)
-		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))`,
+		           <= TIMESTAMPADD(MICROSECOND, ?, NOW(3)))
+		 ORDER BY nr.user_id, ms.last_publish_at DESC, ms.created_at DESC`,
 		RuleZoneBreach,
 		ProviderBark,
 		scheduleSlack.Microseconds(),
@@ -599,7 +649,16 @@ func (s *Service) processDueZoneBreaches(ctx context.Context) {
 		}
 		due = append(due, item)
 	}
+	sentUsers := make(map[int64]bool)
 	for _, item := range due {
+		if sentUsers[item.UserID] {
+			continue
+		}
+		payload, online, ok := s.hub.LatestZone(item.SessionID)
+		if !ok || !online || !zoneBreachActive(payload, time.Now()) {
+			continue
+		}
+		sentUsers[item.UserID] = true
 		s.sendZoneBreach(ctx, item, time.Now())
 	}
 }

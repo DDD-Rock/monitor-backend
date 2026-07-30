@@ -96,3 +96,14 @@ func TestValidateEnvelopeRejectsMalformedZone(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateEnvelopeAcceptsClientState(t *testing.T) {
+	message := []byte(`{"type":"client_state","sequence":1,"payload":{"mode":"follow_heal","running":true}}`)
+	envelope, err := ValidateEnvelope(message)
+	if err != nil {
+		t.Fatalf("expected valid client state, got %v", err)
+	}
+	if envelope.Type != TypeClientState {
+		t.Fatalf("expected %s, got %s", TypeClientState, envelope.Type)
+	}
+}

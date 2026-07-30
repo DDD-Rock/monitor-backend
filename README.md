@@ -1,6 +1,7 @@
 # AutoBuff Monitor Server
 
-AutoBuff 远程纯标注监控的 Go 服务端。客户端与网页分别登录同一账号，服务端自动把它们接入该账号唯一的监控通道，不再生成或分发预览 Key。
+AutoBuff 远程控制与纯标注监控的 Go 服务端。一个账号可以登录多台客户端，每台
+客户端拥有独立监控通道和全局唯一的趣味名称。
 
 ## 本地配置
 
@@ -18,6 +19,18 @@ mysql -u root -p < migrations/monitor_schema.sql
 
 从旧版预览 Token 模式升级时，先执行
 `migrations/account_monitor_migration.sql`。
+
+升级已有账号版数据库时，还需执行：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
+```
+
+超级管理员只能直接在数据库中授予：
+
+```sql
+UPDATE users SET is_super_admin = 1 WHERE username = 'your_admin_username';
+```
 
 ## 启动
 
@@ -49,9 +62,14 @@ ALLOW_REGISTRATION=true
 - `POST /api/auth/register`（需要邀请码）
 - `POST /api/auth/login`
 - `GET /api/auth/me`
+- `GET /api/clients`
+- `GET /api/admin/users`（超级管理员）
+- `PATCH /api/admin/users/{id}/status`（超级管理员）
+- `PUT /api/admin/users/{id}/password`（超级管理员）
 - `GET /api/healthz`
-- `GET /ws/device`（Bearer 登录令牌）
-- `GET /ws/view?access_token=...`（网页登录令牌）
+- `GET /ws/device?client_id=...`（客户端设备与控制通道）
+- `GET /ws/clients?access_token=...`（网页客户端管理通道）
+- `GET /ws/view?access_token=...&client_id=...`（指定客户端的监控通道）
 - `GET /api/notifications/bark`
 - `PUT /api/notifications/exp-stalled`
 - `PUT /api/notifications/rune-alert`
@@ -61,7 +79,9 @@ ALLOW_REGISTRATION=true
 
 除注册、登录和健康检查外，以上 HTTP 接口均要求账号登录。
 
-发布端支持 `map`、`frame`、`status`、`exp`、`rune` 和 `zone` 六类消息。`exp`
+发布端支持 `map`、`frame`、`status`、`client_state`、`exp`、`rune` 和 `zone`
+消息。`client_state` 同步当前模式和开始/停止状态；网页通过 WebSocket 下发
+`start` / `stop` 指令。`exp`
 包含当前 EXP、经验百分比、识别置信度、状态与识别时间。`rune` 包含符文提示是否
 出现、识别置信度和识别时间。`zone` 包含角色是否离开安全区，以及归一化的安全区
 矩形（左上角原点，`x/y/width/height` 都在 0~1，网页据此画框）；矩形为空表示

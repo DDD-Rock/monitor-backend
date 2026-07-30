@@ -36,8 +36,9 @@ const (
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{3,32}$`)
 
 type authenticatedUser struct {
-	ID       int64
-	Username string
+	ID           int64
+	Username     string
+	IsSuperAdmin bool
 }
 
 type Server struct {
@@ -76,6 +77,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.Handle("GET /api/auth/me", s.requireAuth(http.HandlerFunc(s.handleMe)))
+	mux.Handle("GET /api/clients", s.requireAuth(http.HandlerFunc(s.handleClients)))
+	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
+	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))
+	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
 	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
 	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
 	mux.Handle("POST /api/notifications/bark/test", s.requireAuth(http.HandlerFunc(s.handleBarkTest)))
@@ -86,6 +91,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/monitor/exp-gain/reset-total", s.requireAuth(http.HandlerFunc(s.handleResetEXPGainTotal)))
 	mux.Handle("GET /ws/device", s.requireAuth(http.HandlerFunc(s.handleDeviceWebSocket)))
 	mux.HandleFunc("GET /ws/view", s.handleViewerWebSocket)
+	mux.HandleFunc("GET /ws/clients", s.handleClientsWebSocket)
 	return s.recoverPanic(mux)
 }
 
@@ -184,12 +190,15 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 		s.internalError(w, "issue access token failed", err)
 		return
 	}
+	var isSuperAdmin uint8
+	_ = s.db.QueryRow(`SELECT is_super_admin FROM users WHERE id = ?`, userID).Scan(&isSuperAdmin)
 	writeJSON(w, status, map[string]any{
 		"accessToken": token,
 		"expiresAt":   expiresAt.UnixMilli(),
 		"user": map[string]any{
-			"id":       userID,
-			"username": username,
+			"id":           userID,
+			"username":     username,
+			"isSuperAdmin": isSuperAdmin == 1,
 		},
 	})
 }
@@ -197,15 +206,16 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":       user.ID,
-		"username": user.Username,
+		"id":           user.ID,
+		"username":     user.Username,
+		"isSuperAdmin": user.IsSuperAdmin,
 	})
 }
 
-func (s *Server) ensureActiveSession(ctx context.Context, userID int64) (string, error) {
+func (s *Server) ensureDeviceSession(ctx context.Context, userID int64, clientID string) (string, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -217,48 +227,67 @@ func (s *Server) ensureActiveSession(ctx context.Context, userID int64) (string,
 		`SELECT id FROM users WHERE id = ? FOR UPDATE`,
 		userID,
 	).Scan(&lockedUserID); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	var sessionID string
+	var sessionID, name string
 	err = tx.QueryRowContext(
 		ctx,
-		`SELECT id FROM monitor_sessions WHERE user_id = ? AND status = 1 ORDER BY created_at DESC LIMIT 1`,
+		`SELECT id, name FROM monitor_sessions
+		 WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
 		userID,
-	).Scan(&sessionID)
+		clientID,
+	).Scan(&sessionID, &name)
 	if err == nil {
 		if err := tx.Commit(); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return sessionID, nil
+		return sessionID, name, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+		return "", "", err
 	}
 
 	sessionID, err = randomUUID()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	_, err = tx.ExecContext(
-		ctx,
-		`INSERT INTO monitor_sessions (id, user_id, name)
-		 VALUES (?, ?, '账号监控')`,
-		sessionID,
-		userID,
-	)
+	for attempt := 0; attempt < 20; attempt++ {
+		name = randomClientName()
+		_, err = tx.ExecContext(
+			ctx,
+			`INSERT INTO monitor_sessions (id, user_id, client_id, name)
+			 VALUES (?, ?, ?, ?)`,
+			sessionID,
+			userID,
+			clientID,
+			name,
+		)
+		if err == nil {
+			break
+		}
+		var mysqlError *mysql.MySQLError
+		if !errors.As(err, &mysqlError) || mysqlError.Number != 1062 {
+			return "", "", err
+		}
+	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return sessionID, nil
+	return sessionID, name, nil
 }
 
 func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
-	sessionID, err := s.ensureActiveSession(r.Context(), user.ID)
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if len(clientID) < 8 || len(clientID) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
+		return
+	}
+	sessionID, clientName, err := s.ensureDeviceSession(r.Context(), user.ID, clientID)
 	if err != nil {
 		s.internalError(w, "ensure publisher channel failed", err)
 		return
@@ -272,21 +301,81 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 	connection.SetReadLimit(protocol.MaxMessageBytes)
 
 	connectionID, _ := randomUUID()
-	detach := s.hub.AttachPublisher(sessionID, connectionID)
+	controls, detach := s.hub.AttachDevice(sessionID, user.ID, connectionID)
 	defer detach()
 	_, _ = s.db.ExecContext(r.Context(), `UPDATE monitor_sessions SET last_publish_at = NOW(3) WHERE id = ?`, sessionID)
 
+	identity, _ := json.Marshal(map[string]any{
+		"type":     "identity",
+		"clientId": clientID,
+		"name":     clientName,
+	})
+	if err := connection.Write(r.Context(), websocket.MessageText, identity); err != nil {
+		return
+	}
+
+	type incomingMessage struct {
+		body []byte
+		err  error
+	}
+	incoming := make(chan incomingMessage)
+	go func() {
+		for {
+			_, message, err := connection.Read(r.Context())
+			select {
+			case incoming <- incomingMessage{body: message, err: err}:
+			case <-r.Context().Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	pingTicker := time.NewTicker(25 * time.Second)
+	defer pingTicker.Stop()
 	for {
-		_, message, err := connection.Read(r.Context())
-		if err != nil {
+		select {
+		case item := <-incoming:
+			if item.err != nil {
+				return
+			}
+			envelope, err := protocol.ValidateEnvelope(item.body)
+			if err != nil {
+				_ = connection.Close(websocket.StatusPolicyViolation, err.Error())
+				return
+			}
+			s.hub.Publish(sessionID, envelope, item.body)
+			if envelope.Type == protocol.TypeClientState {
+				var state protocol.ClientStatePayload
+				if json.Unmarshal(envelope.Payload, &state) == nil {
+					_, _ = s.db.ExecContext(
+						r.Context(),
+						`UPDATE monitor_sessions SET mode = ?, running = ?, last_publish_at = NOW(3) WHERE id = ?`,
+						state.Mode, state.Running, sessionID,
+					)
+				}
+			}
+		case command, ok := <-controls:
+			if !ok {
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			err := connection.Write(ctx, websocket.MessageText, command)
+			cancel()
+			if err != nil {
+				return
+			}
+		case <-pingTicker.C:
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			err := connection.Ping(ctx)
+			cancel()
+			if err != nil {
+				return
+			}
+		case <-r.Context().Done():
 			return
 		}
-		envelope, err := protocol.ValidateEnvelope(message)
-		if err != nil {
-			_ = connection.Close(websocket.StatusPolicyViolation, err.Error())
-			return
-		}
-		s.hub.Publish(sessionID, envelope, message)
 	}
 }
 
@@ -296,9 +385,29 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sessionID, err := s.ensureActiveSession(r.Context(), user.ID)
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	var sessionID string
+	var err error
+	if clientID != "" {
+		err = s.db.QueryRowContext(
+			r.Context(),
+			`SELECT id FROM monitor_sessions WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
+			user.ID, clientID,
+		).Scan(&sessionID)
+	} else {
+		err = s.db.QueryRowContext(
+			r.Context(),
+			`SELECT id FROM monitor_sessions WHERE user_id = ? AND status = 1
+			 ORDER BY last_publish_at DESC, created_at DESC LIMIT 1`,
+			user.ID,
+		).Scan(&sessionID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "client_not_found", "尚未找到可监控的客户端")
+		return
+	}
 	if err != nil {
-		s.internalError(w, "ensure viewer channel failed", err)
+		s.internalError(w, "find viewer channel failed", err)
 		return
 	}
 
@@ -366,18 +475,29 @@ func (s *Server) authenticateToken(w http.ResponseWriter, r *http.Request, raw s
 		return authenticatedUser{}, false
 	}
 	var activeUsername string
+	var isSuperAdmin uint8
 	if err := s.db.QueryRowContext(
 		r.Context(),
-		`SELECT username FROM users WHERE id = ? AND status = 1 LIMIT 1`,
+		`SELECT username, is_super_admin FROM users WHERE id = ? AND status = 1 LIMIT 1`,
 		userID,
-	).Scan(&activeUsername); err != nil {
+	).Scan(&activeUsername, &isSuperAdmin); err != nil {
 		writeError(w, http.StatusUnauthorized, "account_disabled", "账号不可用，请重新登录")
 		return authenticatedUser{}, false
 	}
 	if activeUsername != "" {
 		username = activeUsername
 	}
-	return authenticatedUser{ID: userID, Username: username}, true
+	return authenticatedUser{ID: userID, Username: username, IsSuperAdmin: isSuperAdmin == 1}, true
+}
+
+func (s *Server) requireSuperAdmin(next http.Handler) http.Handler {
+	return s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !mustUser(r.Context()).IsSuperAdmin {
+			writeError(w, http.StatusForbidden, "admin_required", "仅超级管理员可以执行此操作")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 func mustUser(ctx context.Context) authenticatedUser {
@@ -434,4 +554,19 @@ func randomUUID() (string, error) {
 	bytes[8] = (bytes[8] & 0x3f) | 0x80
 	encoded := hex.EncodeToString(bytes)
 	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
+}
+
+func randomClientName() string {
+	adjectives := []string{"追风", "月光", "薄荷", "星尘", "橘子", "云朵", "琥珀", "青柠", "银河", "晚霞", "松露", "泡泡"}
+	animals := []string{"水獭", "浣熊", "狐狸", "企鹅", "海豹", "熊猫", "松鼠", "鲸鱼", "兔子", "猫头鹰", "羊驼", "小鹿"}
+	randomBytes := make([]byte, 3)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return fmt.Sprintf("漫游设备-%d", time.Now().UnixNano()%10000)
+	}
+	return fmt.Sprintf(
+		"%s%s-%03d",
+		adjectives[int(randomBytes[0])%len(adjectives)],
+		animals[int(randomBytes[1])%len(animals)],
+		int(randomBytes[2])*4+int(randomBytes[0])%4,
+	)
 }

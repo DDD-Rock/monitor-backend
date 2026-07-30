@@ -38,6 +38,60 @@ func TestSubscriberReceivesSnapshotAndLatestFrame(t *testing.T) {
 	}
 }
 
+func TestDeviceReceivesControlAndClientObserverIsNotified(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	updates, unsubscribe := hub.SubscribeClients(42, "observer-1")
+	defer unsubscribe()
+	<-updates
+
+	controls, detach := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detach()
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for device list update")
+	}
+
+	if !hub.SendCommand("session-1", protocol.ClientCommand{Type: "command", Action: "start"}) {
+		t.Fatal("expected command to be accepted for online device")
+	}
+	select {
+	case message := <-controls:
+		if string(message) != `{"type":"command","action":"start"}` {
+			t.Fatalf("unexpected command: %s", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for command")
+	}
+}
+
+func TestClientConnectionDoesNotMarkStoppedMonitorOnline(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	_, detach := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detach()
+	connected, _, _ := hub.ClientStatus("session-1")
+	if !connected {
+		t.Fatal("expected device to be connected")
+	}
+	_, monitorOnline, _ := hub.LatestEXP("session-1")
+	if monitorOnline {
+		t.Fatal("connected stopped device must not make monitor data online")
+	}
+
+	hub.Publish("session-1", protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":true}`),
+	}, nil)
+	_, monitorOnline, _ = hub.LatestEXP("session-1")
+	if !monitorOnline {
+		t.Fatal("running monitor mode should make monitor data online")
+	}
+}
+
 func TestSnapshotIncludesLatestEXP(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

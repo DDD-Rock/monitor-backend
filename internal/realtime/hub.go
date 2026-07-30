@@ -11,6 +11,8 @@ import (
 type Room struct {
 	mu           sync.RWMutex
 	publisher    string
+	userID       int64
+	controls     chan []byte
 	viewers      map[string]chan []byte
 	latestMap    json.RawMessage
 	latestFrame  json.RawMessage
@@ -19,18 +21,24 @@ type Room struct {
 	latestRune   json.RawMessage
 	latestZone   json.RawMessage
 	latestGain   json.RawMessage
+	clientState  protocol.ClientStatePayload
+	connected    bool
 	online       bool
 	updatedAt    int64
 }
 
 type Hub struct {
-	mu     sync.Mutex
-	rooms  map[string]*Room
-	closed bool
+	mu              sync.Mutex
+	rooms           map[string]*Room
+	clientObservers map[int64]map[string]chan struct{}
+	closed          bool
 }
 
 func NewHub() *Hub {
-	return &Hub{rooms: make(map[string]*Room)}
+	return &Hub{
+		rooms:           make(map[string]*Room),
+		clientObservers: make(map[int64]map[string]chan struct{}),
+	}
 }
 
 func (h *Hub) room(sessionID string) *Room {
@@ -45,23 +53,36 @@ func (h *Hub) room(sessionID string) *Room {
 }
 
 func (h *Hub) AttachPublisher(sessionID, connectionID string) func() {
+	_, detach := h.AttachDevice(sessionID, 0, connectionID)
+	return detach
+}
+
+func (h *Hub) AttachDevice(sessionID string, userID int64, connectionID string) (<-chan []byte, func()) {
 	room := h.room(sessionID)
 	room.mu.Lock()
 	room.publisher = connectionID
-	room.online = true
+	room.userID = userID
+	room.controls = make(chan []byte, 8)
+	room.connected = true
+	room.online = userID == 0 || (room.clientState.Mode == "monitor" && room.clientState.Running)
 	room.updatedAt = time.Now().UnixMilli()
+	controls := room.controls
 	room.mu.Unlock()
 	room.broadcastSnapshot()
+	h.notifyClientObservers(userID)
 
-	return func() {
+	return controls, func() {
 		room.mu.Lock()
 		if room.publisher == connectionID {
 			room.publisher = ""
+			room.controls = nil
+			room.connected = false
 			room.online = false
 			room.updatedAt = time.Now().UnixMilli()
 		}
 		room.mu.Unlock()
 		room.broadcastSnapshot()
+		h.notifyClientObservers(userID)
 	}
 }
 
@@ -83,10 +104,92 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 		room.latestZone = append(room.latestZone[:0], envelope.Payload...)
 	case protocol.TypeGain:
 		room.latestGain = append(room.latestGain[:0], envelope.Payload...)
+	case protocol.TypeClientState:
+		_ = json.Unmarshal(envelope.Payload, &room.clientState)
+		room.online = room.clientState.Mode == "monitor" && room.clientState.Running
 	}
 	room.updatedAt = time.Now().UnixMilli()
 	room.mu.Unlock()
 	room.broadcast(raw)
+	if envelope.Type == protocol.TypeClientState {
+		h.notifyClientObservers(room.userID)
+	}
+}
+
+func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool {
+	body, err := json.Marshal(command)
+	if err != nil {
+		return false
+	}
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	controls := room.controls
+	connected := room.connected
+	room.mu.RUnlock()
+	if !connected || controls == nil {
+		return false
+	}
+	select {
+	case controls <- body:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Hub) ClientStatus(sessionID string) (online bool, state protocol.ClientStatePayload, updatedAt int64) {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return false, protocol.ClientStatePayload{}, 0
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.connected, room.clientState, room.updatedAt
+}
+
+func (h *Hub) SubscribeClients(userID int64, observerID string) (<-chan struct{}, func()) {
+	channel := make(chan struct{}, 1)
+	h.mu.Lock()
+	if h.clientObservers[userID] == nil {
+		h.clientObservers[userID] = make(map[string]chan struct{})
+	}
+	h.clientObservers[userID][observerID] = channel
+	h.mu.Unlock()
+	channel <- struct{}{}
+	return channel, func() {
+		h.mu.Lock()
+		if observers := h.clientObservers[userID]; observers != nil {
+			if existing, ok := observers[observerID]; ok {
+				delete(observers, observerID)
+				close(existing)
+			}
+			if len(observers) == 0 {
+				delete(h.clientObservers, userID)
+			}
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *Hub) notifyClientObservers(userID int64) {
+	if userID <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, channel := range h.clientObservers[userID] {
+		select {
+		case channel <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // PublishGain 由服务端写入经验累计快照并广播给查看端。
@@ -239,10 +342,18 @@ func (h *Hub) Close() {
 	h.closed = true
 	for _, room := range h.rooms {
 		room.mu.Lock()
+		room.controls = nil
 		for id, channel := range room.viewers {
 			delete(room.viewers, id)
 			close(channel)
 		}
 		room.mu.Unlock()
+	}
+	for userID, observers := range h.clientObservers {
+		for id, channel := range observers {
+			delete(observers, id)
+			close(channel)
+		}
+		delete(h.clientObservers, userID)
 	}
 }

@@ -13,6 +13,7 @@ const (
 	TypeEXP         = "exp"
 	TypeRune        = "rune"
 	TypeZone        = "zone"
+	TypeClientState = "client_state"
 	// TypeGain 由服务端根据 EXP 增量汇总后推给查看端，设备端不会上报这类消息。
 	TypeGain     = "gain"
 	TypeSnapshot = "snapshot"
@@ -64,6 +65,16 @@ type FramePayload struct {
 type StatusPayload struct {
 	Online  bool   `json:"online"`
 	Message string `json:"message"`
+}
+
+type ClientStatePayload struct {
+	Mode    string `json:"mode"`
+	Running bool   `json:"running"`
+}
+
+type ClientCommand struct {
+	Type   string `json:"type"`
+	Action string `json:"action"`
 }
 
 type EXPPayload struct {
@@ -216,6 +227,16 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 		// 报警必须带上矩形，否则网页无从判断跑出了哪个范围。
 		if payload.Outside && payload.Rect == nil {
 			return Envelope{}, errors.New("zone breach must carry the rect")
+		}
+	case TypeClientState:
+		var payload ClientStatePayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return Envelope{}, errors.New("invalid client state payload")
+		}
+		switch payload.Mode {
+		case "dead", "live", "follow_heal", "monitor":
+		default:
+			return Envelope{}, errors.New("invalid client mode")
 		}
 	default:
 		return Envelope{}, errors.New("unsupported message type")

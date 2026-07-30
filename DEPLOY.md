@@ -44,6 +44,14 @@ mysql -u root -p autobuff_monitor < exp_gain_migration.sql
 
 未建表时 Go 服务启动会因加载累计数据失败而退出。
 
+本次多客户端与超级管理员升级还需执行一次：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
+```
+
+先执行数据库迁移，再替换并重启后端；旧后端不认识新增客户端协议。
+
 ## 升级步骤
 
 `/opt/autobuff-monitor/backend/.env` 是生产配置且不在版本控制里，同步源码时

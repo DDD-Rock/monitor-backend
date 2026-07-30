@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS `users` (
     `username` VARCHAR(32) NOT NULL,
     `password_hash` VARCHAR(255) NOT NULL,
     `status` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '1=active, 0=disabled',
+    `is_super_admin` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=no, 1=yes; database-only setting',
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     `last_login_at` DATETIME(3) NULL,
@@ -24,13 +25,18 @@ CREATE TABLE IF NOT EXISTS `users` (
 CREATE TABLE IF NOT EXISTS `monitor_sessions` (
     `id` CHAR(36) NOT NULL,
     `user_id` BIGINT UNSIGNED NOT NULL,
+    `client_id` VARCHAR(64) NULL COMMENT '客户端本机持久化标识',
     `name` VARCHAR(64) NOT NULL DEFAULT '我的电脑',
+    `mode` VARCHAR(24) NOT NULL DEFAULT 'dead',
+    `running` TINYINT UNSIGNED NOT NULL DEFAULT 0,
     `status` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '1=active, 0=revoked',
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     `last_publish_at` DATETIME(3) NULL,
     `revoked_at` DATETIME(3) NULL,
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_monitor_sessions_user_client` (`user_id`, `client_id`),
+    UNIQUE KEY `uk_monitor_sessions_name` (`name`),
     KEY `idx_monitor_sessions_user_status` (`user_id`, `status`),
     CONSTRAINT `fk_monitor_sessions_user`
         FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)

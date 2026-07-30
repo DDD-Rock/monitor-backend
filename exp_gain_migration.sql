@@ -1,5 +1,5 @@
 -- 经验累计（极简模式伪装为流量 / 资源包用量）持久化表。
--- 在已有库上执行本文件即可；新环境也会随 monitor_schema.sql 一并建表。
+-- 在已有库上执行本文件即可；新环境也会随 migrations/monitor_schema.sql 一并建表。
 
 CREATE TABLE IF NOT EXISTS `exp_gain_stats` (
     `user_id` BIGINT UNSIGNED NOT NULL,

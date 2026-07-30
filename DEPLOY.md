@@ -30,11 +30,16 @@ sudo journalctl -u autobuff-monitor -f
 
 ## 数据库增量
 
+全新数据库先执行仓库内的初始化脚本：
+
+```bash
+mysql -u root -p < migrations/monitor_schema.sql
+```
+
 经验累计落库需要先建表（只需执行一次）：
 
 ```bash
-# 在能连上生产 MySQL 的机器上执行工作区根目录的
-# exp_gain_migration.sql
+mysql -u root -p autobuff_monitor < exp_gain_migration.sql
 ```
 
 未建表时 Go 服务启动会因加载累计数据失败而退出。
@@ -93,6 +98,6 @@ BARK_BASE_URL=http://127.0.0.1:29687
 BARK_PUBLIC_URL=http://106.52.208.129:29687
 ```
 
-首次升级需执行根目录的 `bark_notification_migration.sql`。Bark DeviceKey
+首次升级需执行 `migrations/bark_notification_migration.sql`。Bark DeviceKey
 使用 JWT 服务端密钥派生的 AES-GCM 密钥加密保存，因此轮换 `JWT_SECRET`
 之前必须同步迁移已经保存的通知凭证。

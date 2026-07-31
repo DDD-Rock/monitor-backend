@@ -72,6 +72,9 @@ ALLOW_REGISTRATION=true
 - `GET /api/admin/users/{id}/clients`（超级管理员查看用户已绑定客户端）
 - `DELETE /api/admin/users/{id}/clients/{sessionId}`（超级管理员解绑客户端）
 - `PATCH /api/admin/users/{id}/client-limit`（超级管理员设置客户端数量上限）
+- `GET /api/admin/maps`（超级管理员浏览云端地图库元数据）
+- `POST /api/admin/maps`（超级管理员上传/更新地图标注）
+- `GET /api/admin/maps/{id}`（超级管理员按需下载单张地图）
 - `GET /api/healthz`
 - `GET /ws/device?client_id=...`（客户端设备与控制通道）
 - `GET /ws/clients?access_token=...`（网页客户端管理通道）

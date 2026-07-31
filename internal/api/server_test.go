@@ -42,6 +42,9 @@ func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 		{http.MethodGet, "/api/admin/users/1/clients", ""},
 		{http.MethodDelete, "/api/admin/users/1/clients/00000000-0000-0000-0000-000000000000", ""},
 		{http.MethodPatch, "/api/admin/users/1/client-limit", `{"maxClientCount":1}`},
+		{http.MethodGet, "/api/admin/maps", ""},
+		{http.MethodPost, "/api/admin/maps", `{"formatVersion":1,"maps":[]}`},
+		{http.MethodGet, "/api/admin/maps/1", ""},
 	} {
 		request := httptest.NewRequest(item.method, item.path, strings.NewReader(item.body))
 		recorder := httptest.NewRecorder()

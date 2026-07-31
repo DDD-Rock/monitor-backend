@@ -52,6 +52,12 @@ mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
 
 先执行数据库迁移，再替换并重启后端；旧后端不认识新增客户端协议。
 
+云端地图标注功能还需执行一次：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/cloud_maps_migration.sql
+```
+
 ## 升级步骤
 
 `/opt/autobuff-monitor/backend/.env` 是生产配置且不在版本控制里，同步源码时

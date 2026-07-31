@@ -37,6 +37,11 @@ func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 		{http.MethodPut, "/api/notifications/zone-breach", `{"enabled":true}`},
 		{http.MethodGet, "/api/monitor/exp-gain", ""},
 		{http.MethodPost, "/api/monitor/exp-gain/reset-total", ""},
+		{http.MethodPost, "/api/clients/bind", `{"clientId":"test-client-id"}`},
+		{http.MethodGet, "/api/clients/authorization?client_id=test-client-id", ""},
+		{http.MethodGet, "/api/admin/users/1/clients", ""},
+		{http.MethodDelete, "/api/admin/users/1/clients/00000000-0000-0000-0000-000000000000", ""},
+		{http.MethodPatch, "/api/admin/users/1/client-limit", `{"maxClientCount":1}`},
 	} {
 		request := httptest.NewRequest(item.method, item.path, strings.NewReader(item.body))
 		recorder := httptest.NewRecorder()

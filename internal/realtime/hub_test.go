@@ -92,6 +92,40 @@ func TestClientConnectionDoesNotMarkStoppedMonitorOnline(t *testing.T) {
 	}
 }
 
+func TestDisconnectDeviceSignalsActiveConnection(t *testing.T) {
+	t.Parallel()
+
+	hub := NewHub()
+	defer hub.Close()
+
+	controls, detach := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detach()
+
+	if !hub.DisconnectDevice("session-1") {
+		t.Fatal("expected active device to accept disconnect signal")
+	}
+	select {
+	case command := <-controls:
+		var decoded protocol.ClientCommand
+		if err := json.Unmarshal(command, &decoded); err != nil {
+			t.Fatalf("decode unbind command: %v", err)
+		}
+		if decoded.Action != "unbind" {
+			t.Fatalf("expected unbind command, got %q", decoded.Action)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for unbind command")
+	}
+	select {
+	case command := <-controls:
+		if command != nil {
+			t.Fatal("expected internal nil disconnect signal after unbind command")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for disconnect signal")
+	}
+}
+
 func TestSnapshotIncludesLatestEXP(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

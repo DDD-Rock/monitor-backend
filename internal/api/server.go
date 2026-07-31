@@ -31,9 +31,15 @@ type contextKey string
 const (
 	userContextKey         contextKey = "authenticated-user"
 	registrationInviteCode            = "XIAOXIN"
+	devicePingInterval                = 30 * time.Second
+	devicePingTimeout                 = 10 * time.Second
+	devicePingFailures                = 2
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{3,32}$`)
+
+var errClientLimitReached = errors.New("client limit reached")
+var errClientUnbound = errors.New("client unbound")
 
 type authenticatedUser struct {
 	ID           int64
@@ -78,9 +84,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.Handle("GET /api/auth/me", s.requireAuth(http.HandlerFunc(s.handleMe)))
 	mux.Handle("GET /api/clients", s.requireAuth(http.HandlerFunc(s.handleClients)))
+	mux.Handle("POST /api/clients/bind", s.requireAuth(http.HandlerFunc(s.handleBindClient)))
+	mux.Handle("GET /api/clients/authorization", s.requireAuth(http.HandlerFunc(s.handleClientAuthorization)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
 	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))
 	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
+	mux.Handle("GET /api/admin/users/{id}/clients", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClients)))
+	mux.Handle("DELETE /api/admin/users/{id}/clients/{sessionId}", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminDeleteUserClient)))
+	mux.Handle("PATCH /api/admin/users/{id}/client-limit", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClientLimit)))
 	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
 	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
 	mux.Handle("POST /api/notifications/bark/test", s.requireAuth(http.HandlerFunc(s.handleBarkTest)))
@@ -203,6 +214,69 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 	})
 }
 
+func (s *Server) handleBindClient(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ClientID string `json:"clientId"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	request.ClientID = strings.TrimSpace(request.ClientID)
+	if len(request.ClientID) < 8 || len(request.ClientID) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
+		return
+	}
+	sessionID, clientName, err := s.ensureDeviceSession(
+		r.Context(),
+		mustUser(r.Context()).ID,
+		request.ClientID,
+		true,
+	)
+	if err != nil {
+		if errors.Is(err, errClientLimitReached) {
+			writeError(w, http.StatusForbidden, "client_limit_reached", "该账号绑定的客户端数量已达到上限，请联系管理员解绑旧客户端或调整额度")
+			return
+		}
+		s.internalError(w, "bind client failed", err)
+		return
+	}
+	_, _ = s.db.ExecContext(
+		r.Context(),
+		`UPDATE monitor_sessions SET last_publish_at = NOW(3) WHERE id = ?`,
+		sessionID,
+	)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":       sessionID,
+		"clientId": request.ClientID,
+		"name":     clientName,
+	})
+}
+
+func (s *Server) handleClientAuthorization(w http.ResponseWriter, r *http.Request) {
+	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
+	if len(clientID) < 8 || len(clientID) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
+		return
+	}
+	var exists int
+	err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT 1 FROM monitor_sessions
+		 WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
+		mustUser(r.Context()).ID,
+		clientID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "client_unbound", "当前客户端已被管理员解绑，请重新登录")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "check client authorization failed", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -212,7 +286,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) ensureDeviceSession(ctx context.Context, userID int64, clientID string) (string, string, error) {
+func (s *Server) ensureDeviceSession(
+	ctx context.Context,
+	userID int64,
+	clientID string,
+	allowRebind bool,
+) (string, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", "", err
@@ -222,23 +301,51 @@ func (s *Server) ensureDeviceSession(ctx context.Context, userID int64, clientID
 	// 锁定账号行，将同一账号首次连接时的“查询并创建”串行化。
 	// 这样无需给历史 monitor_sessions 表增加生成列或唯一索引。
 	var lockedUserID int64
+	var maxClientCount uint32
 	if err := tx.QueryRowContext(
 		ctx,
-		`SELECT id FROM users WHERE id = ? FOR UPDATE`,
+		`SELECT id, max_client_count FROM users WHERE id = ? AND status = 1 FOR UPDATE`,
 		userID,
-	).Scan(&lockedUserID); err != nil {
+	).Scan(&lockedUserID, &maxClientCount); err != nil {
 		return "", "", err
 	}
 
 	var sessionID, name string
+	var sessionStatus uint8
 	err = tx.QueryRowContext(
 		ctx,
-		`SELECT id, name FROM monitor_sessions
-		 WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
+		`SELECT id, name, status FROM monitor_sessions
+		 WHERE user_id = ? AND client_id = ? LIMIT 1`,
 		userID,
 		clientID,
-	).Scan(&sessionID, &name)
+	).Scan(&sessionID, &name, &sessionStatus)
 	if err == nil {
+		if sessionStatus == 0 && !allowRebind {
+			return "", "", errClientUnbound
+		}
+		if sessionStatus == 0 {
+			var clientCount uint32
+			if err := tx.QueryRowContext(
+				ctx,
+				`SELECT COUNT(*) FROM monitor_sessions
+				 WHERE user_id = ? AND status = 1 AND client_id IS NOT NULL`,
+				userID,
+			).Scan(&clientCount); err != nil {
+				return "", "", err
+			}
+			if clientCount >= maxClientCount {
+				return "", "", errClientLimitReached
+			}
+			if _, err := tx.ExecContext(
+				ctx,
+				`UPDATE monitor_sessions
+				 SET status = 1, running = 0, revoked_at = NULL
+				 WHERE id = ?`,
+				sessionID,
+			); err != nil {
+				return "", "", err
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return "", "", err
 		}
@@ -246,6 +353,19 @@ func (s *Server) ensureDeviceSession(ctx context.Context, userID int64, clientID
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", "", err
+	}
+
+	var clientCount uint32
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM monitor_sessions
+		 WHERE user_id = ? AND status = 1 AND client_id IS NOT NULL`,
+		userID,
+	).Scan(&clientCount); err != nil {
+		return "", "", err
+	}
+	if clientCount >= maxClientCount {
+		return "", "", errClientLimitReached
 	}
 
 	sessionID, err = randomUUID()
@@ -287,8 +407,16 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
 		return
 	}
-	sessionID, clientName, err := s.ensureDeviceSession(r.Context(), user.ID, clientID)
+	sessionID, clientName, err := s.ensureDeviceSession(r.Context(), user.ID, clientID, false)
 	if err != nil {
+		if errors.Is(err, errClientLimitReached) {
+			writeError(w, http.StatusForbidden, "client_limit_reached", "该账号绑定的客户端数量已达到上限，请联系管理员解绑旧客户端或调整额度")
+			return
+		}
+		if errors.Is(err, errClientUnbound) {
+			writeError(w, http.StatusForbidden, "client_unbound", "该客户端已被管理员解绑，请重新登录后再使用")
+			return
+		}
 		s.internalError(w, "ensure publisher channel failed", err)
 		return
 	}
@@ -332,14 +460,18 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	pingTicker := time.NewTicker(25 * time.Second)
+	pingTicker := time.NewTicker(devicePingInterval)
 	defer pingTicker.Stop()
+	consecutivePingFailures := 0
 	for {
 		select {
 		case item := <-incoming:
 			if item.err != nil {
 				return
 			}
+			// Any received message proves the device is alive, even when a
+			// previous pong arrived just after the Ping deadline.
+			consecutivePingFailures = 0
 			envelope, err := protocol.ValidateEnvelope(item.body)
 			if err != nil {
 				_ = connection.Close(websocket.StatusPolicyViolation, err.Error())
@@ -357,7 +489,8 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		case command, ok := <-controls:
-			if !ok {
+			if !ok || command == nil {
+				_ = connection.Close(websocket.StatusPolicyViolation, "client unbound")
 				return
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -367,12 +500,17 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-pingTicker.C:
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(r.Context(), devicePingTimeout)
 			err := connection.Ping(ctx)
 			cancel()
 			if err != nil {
-				return
+				consecutivePingFailures++
+				if consecutivePingFailures >= devicePingFailures {
+					return
+				}
+				continue
 			}
+			consecutivePingFailures = 0
 		case <-r.Context().Done():
 			return
 		}

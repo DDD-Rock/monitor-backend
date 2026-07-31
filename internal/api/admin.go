@@ -19,16 +19,19 @@ type adminUserItem struct {
 	CreatedAt      int64  `json:"createdAt"`
 	LastLoginAt    *int64 `json:"lastLoginAt"`
 	ConnectedCount int    `json:"connectedClientCount"`
+	MaxClientCount uint32 `json:"maxClientCount"`
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(
 		r.Context(),
 		`SELECT u.id, u.username, u.status, u.is_super_admin, u.created_at, u.last_login_at,
-		        COUNT(CASE WHEN ms.status = 1 THEN 1 END)
+		        u.max_client_count,
+		        COUNT(CASE WHEN ms.status = 1 AND ms.client_id IS NOT NULL THEN 1 END)
 		 FROM users u
 		 LEFT JOIN monitor_sessions ms ON ms.user_id = u.id
-		 GROUP BY u.id, u.username, u.status, u.is_super_admin, u.created_at, u.last_login_at
+		 GROUP BY u.id, u.username, u.status, u.is_super_admin, u.created_at, u.last_login_at,
+		          u.max_client_count
 		 ORDER BY u.created_at DESC`,
 	)
 	if err != nil {
@@ -44,7 +47,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		var lastLogin sql.NullTime
 		if err := rows.Scan(
 			&item.ID, &item.Username, &item.Status, &isSuperAdmin,
-			&createdAt, &lastLogin, &item.ConnectedCount,
+			&createdAt, &lastLogin, &item.MaxClientCount, &item.ConnectedCount,
 		); err != nil {
 			s.internalError(w, "scan users failed", err)
 			return
@@ -58,6 +61,104 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		users = append(users, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+}
+
+func (s *Server) handleAdminUserClients(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requestedUserID(w, r)
+	if !ok {
+		return
+	}
+	var maxClientCount uint32
+	if err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT max_client_count FROM users WHERE id = ?`,
+		userID,
+	).Scan(&maxClientCount); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "user_not_found", "用户不存在")
+		return
+	} else if err != nil {
+		s.internalError(w, "load user client limit failed", err)
+		return
+	}
+	items, err := s.clientItems(r.Context(), userID)
+	if err != nil {
+		s.internalError(w, "list user clients failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"clients":        items,
+		"maxClientCount": maxClientCount,
+	})
+}
+
+func (s *Server) handleAdminDeleteUserClient(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requestedUserID(w, r)
+	if !ok {
+		return
+	}
+	sessionID := strings.TrimSpace(r.PathValue("sessionId"))
+	if len(sessionID) != 36 {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "客户端记录编号无效")
+		return
+	}
+	result, err := s.db.ExecContext(
+		r.Context(),
+		`UPDATE monitor_sessions
+		 SET status = 0, running = 0, revoked_at = NOW(3)
+		 WHERE id = ? AND user_id = ? AND client_id IS NOT NULL AND status = 1`,
+		sessionID, userID,
+	)
+	if err != nil {
+		s.internalError(w, "delete user client failed", err)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		writeError(w, http.StatusNotFound, "client_not_found", "客户端不存在或已解绑")
+		return
+	}
+	s.hub.DisconnectDevice(sessionID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminUserClientLimit(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requestedUserID(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		MaxClientCount *uint32 `json:"maxClientCount"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.MaxClientCount == nil || *request.MaxClientCount > 100 {
+		writeError(w, http.StatusBadRequest, "invalid_client_limit", "客户端数量上限必须在 0 到 100 之间")
+		return
+	}
+	result, err := s.db.ExecContext(
+		r.Context(),
+		`UPDATE users SET max_client_count = ? WHERE id = ?`,
+		*request.MaxClientCount, userID,
+	)
+	if err != nil {
+		s.internalError(w, "update user client limit failed", err)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		var exists int
+		err = s.db.QueryRowContext(r.Context(), `SELECT 1 FROM users WHERE id = ?`, userID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "user_not_found", "用户不存在")
+			return
+		}
+		if err != nil {
+			s.internalError(w, "check user failed", err)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func requestedUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {

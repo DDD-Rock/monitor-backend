@@ -21,13 +21,14 @@ type clientItem struct {
 	Mode       string `json:"mode"`
 	Running    bool   `json:"running"`
 	Online     bool   `json:"online"`
+	CreatedAt  int64  `json:"createdAt"`
 	LastSeenAt *int64 `json:"lastSeenAt"`
 }
 
 func (s *Server) clientItems(ctx context.Context, userID int64) ([]clientItem, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT id, client_id, name, mode, running, last_publish_at
+		`SELECT id, client_id, name, mode, running, created_at, last_publish_at
 		 FROM monitor_sessions
 		 WHERE user_id = ? AND status = 1 AND client_id IS NOT NULL
 		 ORDER BY last_publish_at DESC, created_at DESC`,
@@ -42,11 +43,13 @@ func (s *Server) clientItems(ctx context.Context, userID int64) ([]clientItem, e
 	for rows.Next() {
 		var item clientItem
 		var running uint8
+		var createdAt time.Time
 		var lastSeen sql.NullTime
-		if err := rows.Scan(&item.ID, &item.ClientID, &item.Name, &item.Mode, &running, &lastSeen); err != nil {
+		if err := rows.Scan(&item.ID, &item.ClientID, &item.Name, &item.Mode, &running, &createdAt, &lastSeen); err != nil {
 			return nil, err
 		}
 		item.Running = running == 1
+		item.CreatedAt = createdAt.UnixMilli()
 		online, state, _ := s.hub.ClientStatus(item.ID)
 		item.Online = online
 		if item.Online && state.Mode != "" {

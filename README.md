@@ -9,6 +9,7 @@ AutoBuff 远程控制与纯标注监控的 Go 服务端。一个账号可以登�
 
 - `DATABASE_DSN`
 - `JWT_SECRET`
+- `JWT_TTL`（默认 `168h`，即 7 天）
 - `PUBLIC_BASE_URL`
 
 执行仓库内的 `migrations/monitor_schema.sql` 创建 MySQL 数据库表：
@@ -63,9 +64,14 @@ ALLOW_REGISTRATION=true
 - `POST /api/auth/login`
 - `GET /api/auth/me`
 - `GET /api/clients`
+- `POST /api/clients/bind`（登录后的软件登记本机身份）
+- `GET /api/clients/authorization?client_id=...`（客户端定期检查授权状态）
 - `GET /api/admin/users`（超级管理员）
 - `PATCH /api/admin/users/{id}/status`（超级管理员）
 - `PUT /api/admin/users/{id}/password`（超级管理员）
+- `GET /api/admin/users/{id}/clients`（超级管理员查看用户已绑定客户端）
+- `DELETE /api/admin/users/{id}/clients/{sessionId}`（超级管理员解绑客户端）
+- `PATCH /api/admin/users/{id}/client-limit`（超级管理员设置客户端数量上限）
 - `GET /api/healthz`
 - `GET /ws/device?client_id=...`（客户端设备与控制通道）
 - `GET /ws/clients?access_token=...`（网页客户端管理通道）

@@ -128,9 +128,9 @@ func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool
 		return false
 	}
 	room.mu.RLock()
+	defer room.mu.RUnlock()
 	controls := room.controls
 	connected := room.connected
-	room.mu.RUnlock()
 	if !connected || controls == nil {
 		return false
 	}
@@ -140,6 +140,34 @@ func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool
 	default:
 		return false
 	}
+}
+
+// DisconnectDevice sends an unbind command and then asks the websocket handler
+// to close the active connection. A nil frame is internal-only.
+func (h *Hub) DisconnectDevice(sessionID string) bool {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return false
+	}
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	controls := room.controls
+	connected := room.connected
+	if !connected || controls == nil {
+		return false
+	}
+	command, err := json.Marshal(protocol.ClientCommand{Type: "command", Action: "unbind"})
+	if err != nil {
+		return false
+	}
+	for len(controls) > 0 {
+		<-controls
+	}
+	controls <- command
+	controls <- nil
+	return true
 }
 
 func (h *Hub) ClientStatus(sessionID string) (online bool, state protocol.ClientStatePayload, updatedAt int64) {

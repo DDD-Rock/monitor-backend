@@ -86,6 +86,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /api/clients", s.requireAuth(http.HandlerFunc(s.handleClients)))
 	mux.Handle("POST /api/clients/bind", s.requireAuth(http.HandlerFunc(s.handleBindClient)))
 	mux.Handle("GET /api/clients/authorization", s.requireAuth(http.HandlerFunc(s.handleClientAuthorization)))
+	mux.Handle("DELETE /api/clients/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleDeleteClient)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
 	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))
 	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
@@ -480,10 +481,27 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 				_ = connection.Close(websocket.StatusPolicyViolation, err.Error())
 				return
 			}
-			s.hub.Publish(sessionID, envelope, item.body)
+			accepted := s.hub.Publish(sessionID, envelope, item.body)
 			if envelope.Type == protocol.TypeClientState {
 				var state protocol.ClientStatePayload
 				if json.Unmarshal(envelope.Payload, &state) == nil {
+					if !accepted {
+						state.Running = false
+						s.hub.SendCommand(sessionID, protocol.ClientCommand{
+							Type:   "command",
+							Action: "stop",
+							Reason: "monitor_conflict",
+						})
+					} else if state.Mode == "monitor" && state.Running {
+						// Clear stale rows left by disconnected devices so database-backed
+						// statistics and notifications see the same single active monitor.
+						_, _ = s.db.ExecContext(
+							r.Context(),
+							`UPDATE monitor_sessions SET running = 0
+							 WHERE user_id = ? AND id <> ? AND mode = 'monitor' AND running = 1`,
+							user.ID, sessionID,
+						)
+					}
 					_, _ = s.db.ExecContext(
 						r.Context(),
 						`UPDATE monitor_sessions SET mode = ?, running = ?, last_publish_at = NOW(3) WHERE id = ?`,

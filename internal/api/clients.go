@@ -74,6 +74,48 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"clients": items})
 }
 
+func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionId"))
+	if len(sessionID) != 36 {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "客户端记录编号无效")
+		return
+	}
+	userID := mustUser(r.Context()).ID
+	removed, err := s.revokeClient(r.Context(), userID, sessionID)
+	if err != nil {
+		s.internalError(w, "delete client failed", err)
+		return
+	}
+	if !removed {
+		writeError(w, http.StatusNotFound, "client_not_found", "客户端不存在或已解绑")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeClient(ctx context.Context, userID int64, sessionID string) (bool, error) {
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE monitor_sessions
+		 SET status = 0, running = 0, revoked_at = NOW(3)
+		 WHERE id = ? AND user_id = ? AND client_id IS NOT NULL AND status = 1`,
+		sessionID, userID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	s.hub.DisconnectDevice(sessionID)
+	s.hub.NotifyClients(userID)
+	return true, nil
+}
+
 type clientSocketRequest struct {
 	Type     string `json:"type"`
 	ClientID string `json:"clientId"`

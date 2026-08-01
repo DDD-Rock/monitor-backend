@@ -25,7 +25,7 @@ func TestSumWindow(t *testing.T) {
 	}
 }
 
-func TestMultipleSessionsKeepIndependentEXPBaselines(t *testing.T) {
+func TestSequentialSessionsKeepIndependentEXPBaselines(t *testing.T) {
 	hub := realtime.NewHub()
 	defer hub.Close()
 	service := &Service{hub: hub}
@@ -46,20 +46,19 @@ func TestMultipleSessionsKeepIndependentEXPBaselines(t *testing.T) {
 		return detach
 	}
 
+	publishEXP("session-1", 100)
 	detach1 := connect("session-1")
-	defer detach1()
+	service.sampleSessionLocked(state, "session-1", now)
+	publishEXP("session-1", 130)
+	service.sampleSessionLocked(state, "session-1", now.Add(5*time.Second))
+	detach1()
+
+	publishEXP("session-2", 500)
 	detach2 := connect("session-2")
 	defer detach2()
-
-	publishEXP("session-1", 100)
-	publishEXP("session-2", 500)
-	service.sampleSessionLocked(state, "session-1", now)
-	service.sampleSessionLocked(state, "session-2", now)
-
-	publishEXP("session-1", 130)
+	service.sampleSessionLocked(state, "session-2", now.Add(10*time.Second))
 	publishEXP("session-2", 560)
-	service.sampleSessionLocked(state, "session-1", now.Add(5*time.Second))
-	service.sampleSessionLocked(state, "session-2", now.Add(5*time.Second))
+	service.sampleSessionLocked(state, "session-2", now.Add(15*time.Second))
 
 	if state.totalGained != 90 {
 		t.Fatalf("total gained = %d, want 90", state.totalGained)

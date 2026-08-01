@@ -75,6 +75,7 @@ type ClientStatePayload struct {
 type ClientCommand struct {
 	Type   string `json:"type"`
 	Action string `json:"action"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type EXPPayload struct {

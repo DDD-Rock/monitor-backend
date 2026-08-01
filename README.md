@@ -66,6 +66,7 @@ ALLOW_REGISTRATION=true
 - `GET /api/clients`
 - `POST /api/clients/bind`（登录后的软件登记本机身份）
 - `GET /api/clients/authorization?client_id=...`（客户端定期检查授权状态）
+- `DELETE /api/clients/{sessionId}`（登录用户解绑自己的客户端）
 - `GET /api/admin/users`（超级管理员）
 - `PATCH /api/admin/users/{id}/status`（超级管理员）
 - `PUT /api/admin/users/{id}/password`（超级管理员）

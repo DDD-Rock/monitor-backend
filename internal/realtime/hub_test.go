@@ -92,6 +92,96 @@ func TestClientConnectionDoesNotMarkStoppedMonitorOnline(t *testing.T) {
 	}
 }
 
+func TestOnlyOneDevicePerUserCanRunMonitorMode(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	_, detachFirst := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detachFirst()
+	_, detachSecond := hub.AttachDevice("session-2", 42, "publisher-2")
+	defer detachSecond()
+
+	active := protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":true}`),
+	}
+	if !hub.Publish("session-1", active, nil) {
+		t.Fatal("expected the first monitor to be accepted")
+	}
+	if hub.Publish("session-2", active, nil) {
+		t.Fatal("expected the second monitor on the same account to be rejected")
+	}
+
+	_, firstOnline, _ := hub.LatestEXP("session-1")
+	_, secondOnline, _ := hub.LatestEXP("session-2")
+	if !firstOnline || secondOnline {
+		t.Fatalf("expected only the first monitor online, got first=%v second=%v", firstOnline, secondOnline)
+	}
+
+	stopped := protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":false}`),
+	}
+	if !hub.Publish("session-1", stopped, nil) {
+		t.Fatal("expected stop state to be accepted")
+	}
+	if !hub.Publish("session-2", active, nil) {
+		t.Fatal("expected the second monitor after the first stops to be accepted")
+	}
+}
+
+func TestDifferentUsersCanRunMonitorModeAtTheSameTime(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	_, detachFirst := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detachFirst()
+	_, detachSecond := hub.AttachDevice("session-2", 43, "publisher-2")
+	defer detachSecond()
+
+	active := protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":true}`),
+	}
+	if !hub.Publish("session-1", active, nil) || !hub.Publish("session-2", active, nil) {
+		t.Fatal("expected monitors belonging to different users to be accepted")
+	}
+}
+
+func TestSimultaneousMonitorStartsHaveOneWinner(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	_, detachFirst := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detachFirst()
+	_, detachSecond := hub.AttachDevice("session-2", 42, "publisher-2")
+	defer detachSecond()
+
+	active := protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":true}`),
+	}
+	ready := make(chan struct{})
+	results := make(chan bool, 2)
+	for _, sessionID := range []string{"session-1", "session-2"} {
+		go func() {
+			<-ready
+			results <- hub.Publish(sessionID, active, nil)
+		}()
+	}
+	close(ready)
+
+	accepted := 0
+	for range 2 {
+		if <-results {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted simultaneous monitor starts = %d, want 1", accepted)
+	}
+}
+
 func TestDisconnectDeviceSignalsActiveConnection(t *testing.T) {
 	t.Parallel()
 

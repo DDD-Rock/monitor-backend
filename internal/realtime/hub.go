@@ -30,6 +30,7 @@ type Room struct {
 type Hub struct {
 	mu              sync.Mutex
 	rooms           map[string]*Room
+	activeMonitors  map[int64]string
 	clientObservers map[int64]map[string]chan struct{}
 	closed          bool
 }
@@ -37,6 +38,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		rooms:           make(map[string]*Room),
+		activeMonitors:  make(map[int64]string),
 		clientObservers: make(map[int64]map[string]chan struct{}),
 	}
 }
@@ -72,6 +74,7 @@ func (h *Hub) AttachDevice(sessionID string, userID int64, connectionID string) 
 	h.notifyClientObservers(userID)
 
 	return controls, func() {
+		didDetach := false
 		room.mu.Lock()
 		if room.publisher == connectionID {
 			room.publisher = ""
@@ -79,14 +82,32 @@ func (h *Hub) AttachDevice(sessionID string, userID int64, connectionID string) 
 			room.connected = false
 			room.online = false
 			room.updatedAt = time.Now().UnixMilli()
+			didDetach = true
 		}
 		room.mu.Unlock()
+		if didDetach && userID > 0 {
+			h.mu.Lock()
+			if h.activeMonitors[userID] == sessionID {
+				delete(h.activeMonitors, userID)
+			}
+			h.mu.Unlock()
+		}
 		room.broadcastSnapshot()
 		h.notifyClientObservers(userID)
 	}
 }
 
-func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) {
+// Publish stores and broadcasts a device message. It returns false only when a
+// device tries to enter monitor mode while another device on the same account
+// is already actively monitoring.
+func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) bool {
+	if envelope.Type == protocol.TypeClientState {
+		var state protocol.ClientStatePayload
+		if json.Unmarshal(envelope.Payload, &state) == nil && !h.updateMonitorClaim(sessionID, state) {
+			return false
+		}
+	}
+
 	room := h.room(sessionID)
 	room.mu.Lock()
 	switch envelope.Type {
@@ -114,6 +135,34 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 	if envelope.Type == protocol.TypeClientState {
 		h.notifyClientObservers(room.userID)
 	}
+	return true
+}
+
+// updateMonitorClaim checks and reserves the account's single monitor slot in
+// one critical section, so simultaneous starts cannot both be accepted.
+func (h *Hub) updateMonitorClaim(sessionID string, state protocol.ClientStatePayload) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	current := h.rooms[sessionID]
+	if current == nil {
+		return true
+	}
+	current.mu.RLock()
+	userID := current.userID
+	current.mu.RUnlock()
+	if userID <= 0 {
+		return true
+	}
+	if state.Mode == "monitor" && state.Running {
+		if activeSessionID := h.activeMonitors[userID]; activeSessionID != "" && activeSessionID != sessionID {
+			return false
+		}
+		h.activeMonitors[userID] = sessionID
+	} else if h.activeMonitors[userID] == sessionID {
+		delete(h.activeMonitors, userID)
+	}
+	return true
 }
 
 func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool {
@@ -218,6 +267,11 @@ func (h *Hub) notifyClientObservers(userID int64) {
 		default:
 		}
 	}
+}
+
+// NotifyClients refreshes every open client-management page for an account.
+func (h *Hub) NotifyClients(userID int64) {
+	h.notifyClientObservers(userID)
 }
 
 // PublishGain 由服务端写入经验累计快照并广播给查看端。

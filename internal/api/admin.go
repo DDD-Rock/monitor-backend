@@ -101,23 +101,15 @@ func (s *Server) handleAdminDeleteUserClient(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "invalid_session_id", "客户端记录编号无效")
 		return
 	}
-	result, err := s.db.ExecContext(
-		r.Context(),
-		`UPDATE monitor_sessions
-		 SET status = 0, running = 0, revoked_at = NOW(3)
-		 WHERE id = ? AND user_id = ? AND client_id IS NOT NULL AND status = 1`,
-		sessionID, userID,
-	)
+	removed, err := s.revokeClient(r.Context(), userID, sessionID)
 	if err != nil {
 		s.internalError(w, "delete user client failed", err)
 		return
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
+	if !removed {
 		writeError(w, http.StatusNotFound, "client_not_found", "客户端不存在或已解绑")
 		return
 	}
-	s.hub.DisconnectDevice(sessionID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

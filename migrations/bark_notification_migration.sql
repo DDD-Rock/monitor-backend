@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS `notification_channels` (
     `provider` VARCHAR(32) NOT NULL,
     `secret_ciphertext` TEXT NOT NULL COMMENT '使用服务端密钥加密后的渠道凭证',
     `enabled` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    `urgent_alerts_muted` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '1=符文和鼠标跟随紧急警报全程静音',
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (`id`),

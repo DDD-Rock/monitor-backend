@@ -23,6 +23,7 @@ type barkPushRequest struct {
 	Body      string `json:"body"`
 	Group     string `json:"group,omitempty"`
 	Level     string `json:"level,omitempty"`
+	Volume    *int   `json:"volume,omitempty"`
 	URL       string `json:"url,omitempty"`
 }
 
@@ -39,12 +40,43 @@ func newBarkSender(baseURL string) *barkSender {
 }
 
 func (s *barkSender) push(ctx context.Context, deviceKey, body, targetURL string) error {
+	return s.pushWithOptions(ctx, deviceKey, body, targetURL, "active", nil)
+}
+
+func (s *barkSender) pushCritical(
+	ctx context.Context,
+	deviceKey string,
+	body string,
+	volume int,
+) error {
+	return s.pushCriticalWithURL(ctx, deviceKey, body, "", volume)
+}
+
+func (s *barkSender) pushCriticalWithURL(
+	ctx context.Context,
+	deviceKey string,
+	body string,
+	targetURL string,
+	volume int,
+) error {
+	return s.pushWithOptions(ctx, deviceKey, body, targetURL, "critical", &volume)
+}
+
+func (s *barkSender) pushWithOptions(
+	ctx context.Context,
+	deviceKey string,
+	body string,
+	targetURL string,
+	level string,
+	volume *int,
+) error {
 	payload, err := json.Marshal(barkPushRequest{
 		DeviceKey: deviceKey,
 		Title:     time.Now().Format("2006-01-02 15:04:05"),
 		Body:      body,
 		Group:     "AutoBuff",
-		Level:     "active",
+		Level:     level,
+		Volume:    volume,
 		URL:       targetURL,
 	})
 	if err != nil {

@@ -6,14 +6,16 @@ import (
 )
 
 const (
-	MaxMessageBytes = 16 * 1024
-	TypeMap         = "map"
-	TypeFrame       = "frame"
-	TypeStatus      = "status"
-	TypeEXP         = "exp"
-	TypeRune        = "rune"
-	TypeZone        = "zone"
-	TypeClientState = "client_state"
+	MaxMessageBytes  = 16 * 1024
+	TypeMap          = "map"
+	TypeFrame        = "frame"
+	TypeStatus       = "status"
+	TypeEXP          = "exp"
+	TypeRune         = "rune"
+	TypeVerification = "verification"
+	TypeZone         = "zone"
+	TypeClientState  = "client_state"
+	TypeTeamJoined   = "team_joined"
 	// TypeGain 由服务端根据 EXP 增量汇总后推给查看端，设备端不会上报这类消息。
 	TypeGain     = "gain"
 	TypeSnapshot = "snapshot"
@@ -73,22 +75,40 @@ type ClientStatePayload struct {
 }
 
 type ClientCommand struct {
-	Type   string `json:"type"`
-	Action string `json:"action"`
-	Reason string `json:"reason,omitempty"`
+	Type            string   `json:"type"`
+	Action          string   `json:"action"`
+	Reason          string   `json:"reason,omitempty"`
+	TeamID          int64    `json:"teamId,omitempty"`
+	IsLeader        bool     `json:"isLeader,omitempty"`
+	FirstCreation   bool     `json:"firstCreation,omitempty"`
+	RoleName        string   `json:"roleName,omitempty"`
+	InviteRoleNames []string `json:"inviteRoleNames,omitempty"`
+}
+
+type TeamJoinedPayload struct {
+	TeamID   int64  `json:"teamId"`
+	RoleName string `json:"roleName"`
 }
 
 type EXPPayload struct {
-	CurrentEXP   *int64   `json:"currentEXP"`
-	Percent      *float64 `json:"percent"`
-	Confidence   *float64 `json:"confidence"`
-	Status       string   `json:"status"`
-	RecognizedAt int64    `json:"recognizedAt"`
+	CurrentEXP        *int64   `json:"currentEXP"`
+	Percent           *float64 `json:"percent"`
+	Confidence        *float64 `json:"confidence"`
+	RecognitionMethod string   `json:"recognitionMethod,omitempty"`
+	Status            string   `json:"status"`
+	RecognizedAt      int64    `json:"recognizedAt"`
 }
 
 // RunePayload 描述 Mac 端对「符文诅咒提示横幅」的识别结果。
 // Detected 为 true 表示画面上仍挂着紫色符文提示，需要尽快解除。
 type RunePayload struct {
+	Detected   bool     `json:"detected"`
+	Confidence *float64 `json:"confidence"`
+	DetectedAt int64    `json:"detectedAt"`
+}
+
+// VerificationPayload 描述 Mac 端对「寻找透明图形」鼠标跟随验证弹窗的识别结果。
+type VerificationPayload struct {
 	Detected   bool     `json:"detected"`
 	Confidence *float64 `json:"confidence"`
 	DetectedAt int64    `json:"detectedAt"`
@@ -142,16 +162,17 @@ type Envelope struct {
 }
 
 type Snapshot struct {
-	Type      string          `json:"type"`
-	Online    bool            `json:"online"`
-	Map       json.RawMessage `json:"map,omitempty"`
-	Frame     json.RawMessage `json:"frame,omitempty"`
-	Status    json.RawMessage `json:"status,omitempty"`
-	EXP       json.RawMessage `json:"exp,omitempty"`
-	Rune      json.RawMessage `json:"rune,omitempty"`
-	Zone      json.RawMessage `json:"zone,omitempty"`
-	Gain      json.RawMessage `json:"gain,omitempty"`
-	UpdatedAt int64           `json:"updatedAt"`
+	Type         string          `json:"type"`
+	Online       bool            `json:"online"`
+	Map          json.RawMessage `json:"map,omitempty"`
+	Frame        json.RawMessage `json:"frame,omitempty"`
+	Status       json.RawMessage `json:"status,omitempty"`
+	EXP          json.RawMessage `json:"exp,omitempty"`
+	Rune         json.RawMessage `json:"rune,omitempty"`
+	Verification json.RawMessage `json:"verification,omitempty"`
+	Zone         json.RawMessage `json:"zone,omitempty"`
+	Gain         json.RawMessage `json:"gain,omitempty"`
+	UpdatedAt    int64           `json:"updatedAt"`
 }
 
 func ValidateEnvelope(message []byte) (Envelope, error) {
@@ -214,6 +235,20 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 		if !payload.Detected && payload.Confidence != nil {
 			return Envelope{}, errors.New("cleared rune must not carry confidence")
 		}
+	case TypeVerification:
+		var payload VerificationPayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+			return Envelope{}, errors.New("invalid verification payload")
+		}
+		if payload.DetectedAt <= 0 {
+			return Envelope{}, errors.New("invalid verification timestamp")
+		}
+		if payload.Confidence != nil && (*payload.Confidence < 0 || *payload.Confidence > 1) {
+			return Envelope{}, errors.New("invalid verification confidence")
+		}
+		if !payload.Detected && payload.Confidence != nil {
+			return Envelope{}, errors.New("cleared verification must not carry confidence")
+		}
 	case TypeZone:
 		var payload ZonePayload
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
@@ -235,9 +270,15 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 			return Envelope{}, errors.New("invalid client state payload")
 		}
 		switch payload.Mode {
-		case "dead", "live", "follow_heal", "monitor":
+		case "dead", "live", "follow_heal", "monitor", "temple":
 		default:
 			return Envelope{}, errors.New("invalid client mode")
+		}
+	case TypeTeamJoined:
+		var payload TeamJoinedPayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil ||
+			payload.TeamID <= 0 || len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 {
+			return Envelope{}, errors.New("invalid team joined payload")
 		}
 	default:
 		return Envelope{}, errors.New("unsupported message type")

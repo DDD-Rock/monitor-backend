@@ -25,7 +25,7 @@ type cloudMapName struct {
 func (s *Server) handleCloudMaps(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT m.id, m.map_name, OCTET_LENGTH(m.map_json),
-		        CAST(UNIX_TIMESTAMP(m.updated_at) * 1000 AS SIGNED), u.username
+		        CAST(UNIX_TIMESTAMP(m.updated_at) * 1000 AS SIGNED), u.nickname
 		   FROM cloud_maps m
 		   JOIN users u ON u.id = m.uploaded_by
 		  ORDER BY m.map_name`)
@@ -137,4 +137,23 @@ func (s *Server) handleDownloadCloudMap(w http.ResponseWriter, r *http.Request) 
 		"formatVersion": 1,
 		"maps":          []json.RawMessage{raw},
 	})
+}
+
+func (s *Server) handleDeleteCloudMap(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_map_id", "地图编号无效")
+		return
+	}
+	result, err := s.db.ExecContext(r.Context(), `DELETE FROM cloud_maps WHERE id = ?`, id)
+	if err != nil {
+		s.internalError(w, "delete cloud map failed", err)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		writeError(w, http.StatusNotFound, "map_not_found", "云端地图不存在")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

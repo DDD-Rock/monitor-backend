@@ -19,6 +19,14 @@ type toggleRuneAlertRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
+type toggleMouseFollowVerificationRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type toggleUrgentMuteRequest struct {
+	Muted bool `json:"muted"`
+}
+
 type toggleZoneBreachRequest struct {
 	Enabled bool `json:"enabled"`
 }
@@ -61,7 +69,22 @@ func (s *Server) handleSaveBark(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBarkTest(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
-	s.sendBarkTest(w, r, user.ID)
+	s.sendBarkTest(w, r, user.ID, nil)
+}
+
+func (s *Server) handleBarkCriticalTest(w http.ResponseWriter, r *http.Request) {
+	user := mustUser(r.Context())
+	var request struct {
+		Volume *int `json:"volume"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Volume == nil || *request.Volume < 0 || *request.Volume > 10 {
+		writeError(w, http.StatusBadRequest, "invalid_critical_volume", "紧急通知音量须为 0–10")
+		return
+	}
+	s.sendBarkTest(w, r, user.ID, request.Volume)
 }
 
 func (s *Server) handleEXPStalled(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +135,54 @@ func (s *Server) handleRuneAlert(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, settings)
 }
 
+func (s *Server) handleMouseFollowVerification(w http.ResponseWriter, r *http.Request) {
+	user := mustUser(r.Context())
+	var request toggleMouseFollowVerificationRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.notify.SetMouseFollowVerificationEnabled(
+		r.Context(),
+		user.ID,
+		request.Enabled,
+	); err != nil {
+		if strings.Contains(err.Error(), "尚未配置") {
+			writeError(w, http.StatusConflict, "bark_not_configured", err.Error())
+			return
+		}
+		s.internalError(w, "update mouse follow verification alert failed", err)
+		return
+	}
+	settings, err := s.notify.Settings(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "query updated mouse follow verification settings failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) handleUrgentMute(w http.ResponseWriter, r *http.Request) {
+	user := mustUser(r.Context())
+	var request toggleUrgentMuteRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.notify.SetUrgentAlertsMuted(r.Context(), user.ID, request.Muted); err != nil {
+		if strings.Contains(err.Error(), "尚未配置") {
+			writeError(w, http.StatusConflict, "bark_not_configured", err.Error())
+			return
+		}
+		s.internalError(w, "update urgent alert mute setting failed", err)
+		return
+	}
+	settings, err := s.notify.Settings(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "query updated urgent alert mute setting failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
 func (s *Server) handleZoneBreach(w http.ResponseWriter, r *http.Request) {
 	user := mustUser(r.Context())
 	var request toggleZoneBreachRequest
@@ -134,8 +205,19 @@ func (s *Server) handleZoneBreach(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, settings)
 }
 
-func (s *Server) sendBarkTest(w http.ResponseWriter, r *http.Request, userID int64) {
-	if err := s.notify.SendTest(r.Context(), userID); err != nil {
+func (s *Server) sendBarkTest(
+	w http.ResponseWriter,
+	r *http.Request,
+	userID int64,
+	criticalVolume *int,
+) {
+	var err error
+	if criticalVolume != nil {
+		err = s.notify.SendCriticalTest(r.Context(), userID, *criticalVolume)
+	} else {
+		err = s.notify.SendTest(r.Context(), userID)
+	}
+	if err != nil {
 		if strings.Contains(err.Error(), "尚未配置") {
 			writeError(w, http.StatusConflict, "bark_not_configured", err.Error())
 			return

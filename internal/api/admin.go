@@ -13,7 +13,7 @@ import (
 
 type adminUserItem struct {
 	ID             int64  `json:"id"`
-	Username       string `json:"username"`
+	Nickname       string `json:"nickname"`
 	Status         uint8  `json:"status"`
 	IsSuperAdmin   bool   `json:"isSuperAdmin"`
 	CreatedAt      int64  `json:"createdAt"`
@@ -25,12 +25,12 @@ type adminUserItem struct {
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(
 		r.Context(),
-		`SELECT u.id, u.username, u.status, u.is_super_admin, u.created_at, u.last_login_at,
+		`SELECT u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
 		        u.max_client_count,
 		        COUNT(CASE WHEN ms.status = 1 AND ms.client_id IS NOT NULL THEN 1 END)
 		 FROM users u
 		 LEFT JOIN monitor_sessions ms ON ms.user_id = u.id
-		 GROUP BY u.id, u.username, u.status, u.is_super_admin, u.created_at, u.last_login_at,
+		 GROUP BY u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
 		          u.max_client_count
 		 ORDER BY u.created_at DESC`,
 	)
@@ -46,7 +46,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		var createdAt time.Time
 		var lastLogin sql.NullTime
 		if err := rows.Scan(
-			&item.ID, &item.Username, &item.Status, &isSuperAdmin,
+			&item.ID, &item.Nickname, &item.Status, &isSuperAdmin,
 			&createdAt, &lastLogin, &item.MaxClientCount, &item.ConnectedCount,
 		); err != nil {
 			s.internalError(w, "scan users failed", err)

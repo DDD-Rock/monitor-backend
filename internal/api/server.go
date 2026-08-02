@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"autobuff-monitor/server/internal/auth"
 	"autobuff-monitor/server/internal/config"
@@ -29,14 +30,14 @@ import (
 type contextKey string
 
 const (
-	userContextKey         contextKey = "authenticated-user"
-	registrationInviteCode            = "XIAOXIN"
-	devicePingInterval                = 30 * time.Second
-	devicePingTimeout                 = 10 * time.Second
-	devicePingFailures                = 2
+	userContextKey     contextKey = "authenticated-user"
+	devicePingInterval            = 30 * time.Second
+	devicePingTimeout             = 10 * time.Second
+	devicePingFailures            = 2
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{3,32}$`)
+var inviteCodePattern = regexp.MustCompile(`^[A-Z0-9]{6}$`)
 
 var errClientLimitReached = errors.New("client limit reached")
 var errClientUnbound = errors.New("client unbound")
@@ -44,6 +45,7 @@ var errClientUnbound = errors.New("client unbound")
 type authenticatedUser struct {
 	ID           int64
 	Username     string
+	Nickname     string
 	IsSuperAdmin bool
 }
 
@@ -87,20 +89,33 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/clients/bind", s.requireAuth(http.HandlerFunc(s.handleBindClient)))
 	mux.Handle("GET /api/clients/authorization", s.requireAuth(http.HandlerFunc(s.handleClientAuthorization)))
 	mux.Handle("DELETE /api/clients/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleDeleteClient)))
+	mux.Handle("PUT /api/clients/role-name", s.requireAuth(http.HandlerFunc(s.handleSaveClientRoleName)))
+	mux.Handle("GET /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleRopeTeam)))
+	mux.Handle("PUT /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeam)))
+	mux.Handle("DELETE /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleDeleteRopeTeam)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
 	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))
 	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
 	mux.Handle("GET /api/admin/users/{id}/clients", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClients)))
 	mux.Handle("DELETE /api/admin/users/{id}/clients/{sessionId}", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminDeleteUserClient)))
 	mux.Handle("PATCH /api/admin/users/{id}/client-limit", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClientLimit)))
+	mux.Handle("GET /api/admin/invite-codes", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminInviteCodes)))
+	mux.Handle("POST /api/admin/invite-codes", s.requireSuperAdmin(http.HandlerFunc(s.handleCreateAdminInviteCode)))
+	mux.Handle("DELETE /api/admin/invite-codes/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDeleteAdminInviteCode)))
+	mux.Handle("GET /api/admin/client-versions", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminClientVersions)))
+	mux.Handle("PUT /api/admin/client-versions", s.requireSuperAdmin(http.HandlerFunc(s.handleSaveAdminClientVersion)))
 	mux.Handle("GET /api/admin/maps", s.requireSuperAdmin(http.HandlerFunc(s.handleCloudMaps)))
 	mux.Handle("POST /api/admin/maps", s.requireSuperAdmin(http.HandlerFunc(s.handleUploadCloudMaps)))
 	mux.Handle("GET /api/admin/maps/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDownloadCloudMap)))
+	mux.Handle("DELETE /api/admin/maps/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDeleteCloudMap)))
 	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
 	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
 	mux.Handle("POST /api/notifications/bark/test", s.requireAuth(http.HandlerFunc(s.handleBarkTest)))
+	mux.Handle("POST /api/notifications/bark/test-critical", s.requireAuth(http.HandlerFunc(s.handleBarkCriticalTest)))
 	mux.Handle("PUT /api/notifications/exp-stalled", s.requireAuth(http.HandlerFunc(s.handleEXPStalled)))
 	mux.Handle("PUT /api/notifications/rune-alert", s.requireAuth(http.HandlerFunc(s.handleRuneAlert)))
+	mux.Handle("PUT /api/notifications/mouse-follow-verification", s.requireAuth(http.HandlerFunc(s.handleMouseFollowVerification)))
+	mux.Handle("PUT /api/notifications/urgent-mute", s.requireAuth(http.HandlerFunc(s.handleUrgentMute)))
 	mux.Handle("PUT /api/notifications/zone-breach", s.requireAuth(http.HandlerFunc(s.handleZoneBreach)))
 	mux.Handle("GET /api/monitor/exp-gain", s.requireAuth(http.HandlerFunc(s.handleEXPGain)))
 	mux.Handle("POST /api/monitor/exp-gain/reset-total", s.requireAuth(http.HandlerFunc(s.handleResetEXPGainTotal)))
@@ -120,6 +135,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 type credentialsRequest struct {
 	Username   string `json:"username"`
+	Nickname   string `json:"nickname,omitempty"`
 	Password   string `json:"password"`
 	InviteCode string `json:"inviteCode,omitempty"`
 }
@@ -134,7 +150,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if !validRegistrationInviteCode(request.InviteCode) {
+	request.InviteCode = normalizeInviteCode(request.InviteCode)
+	if !validInviteCode(request.InviteCode) {
 		writeError(w, http.StatusForbidden, "invalid_invite_code", "邀请码无效")
 		return
 	}
@@ -143,8 +160,29 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_username", "用户名须为 3–32 位字母、数字或下划线")
 		return
 	}
+	request.Nickname = strings.TrimSpace(request.Nickname)
+	if !validNickname(request.Nickname) {
+		writeError(w, http.StatusBadRequest, "invalid_nickname", "昵称须为 1–24 个字符且不能包含控制字符")
+		return
+	}
 	if len(request.Password) < 8 || len(request.Password) > 72 {
 		writeError(w, http.StatusBadRequest, "invalid_password", "密码长度须为 8–72 位")
+		return
+	}
+	var inviteAvailable int
+	err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT 1 FROM invite_codes
+		 WHERE code = ? AND used_at IS NULL AND expires_at > NOW(3)
+		 LIMIT 1`,
+		request.InviteCode,
+	).Scan(&inviteAvailable)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "invalid_invite_code", "邀请码无效、已使用或已过期")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "check registration invite code failed", err)
 		return
 	}
 
@@ -153,10 +191,35 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, "password hashing failed", err)
 		return
 	}
-	result, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		s.internalError(w, "begin registration transaction failed", err)
+		return
+	}
+	defer tx.Rollback()
+
+	var inviteCodeID int64
+	err = tx.QueryRowContext(
 		r.Context(),
-		`INSERT INTO users (username, password_hash) VALUES (?, ?)`,
+		`SELECT id FROM invite_codes
+		 WHERE code = ? AND used_at IS NULL AND expires_at > NOW(3)
+		 LIMIT 1 FOR UPDATE`,
+		request.InviteCode,
+	).Scan(&inviteCodeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "invalid_invite_code", "邀请码无效、已使用或已过期")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "validate registration invite code failed", err)
+		return
+	}
+
+	result, err := tx.ExecContext(
+		r.Context(),
+		`INSERT INTO users (username, nickname, password_hash) VALUES (?, ?, ?)`,
 		request.Username,
+		request.Nickname,
 		string(passwordHash),
 	)
 	if err != nil {
@@ -169,11 +232,41 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID, _ := result.LastInsertId()
+	if _, err = tx.ExecContext(
+		r.Context(),
+		`UPDATE invite_codes SET used_by = ?, used_at = NOW(3) WHERE id = ? AND used_at IS NULL`,
+		userID,
+		inviteCodeID,
+	); err != nil {
+		s.internalError(w, "consume registration invite code failed", err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		s.internalError(w, "commit registration failed", err)
+		return
+	}
 	s.respondWithAccessToken(w, userID, request.Username, http.StatusCreated)
 }
 
-func validRegistrationInviteCode(value string) bool {
-	return strings.EqualFold(strings.TrimSpace(value), registrationInviteCode)
+func normalizeInviteCode(value string) string {
+	return strings.ToUpper(strings.TrimSpace(value))
+}
+
+func validInviteCode(value string) bool {
+	return inviteCodePattern.MatchString(value)
+}
+
+func validNickname(value string) bool {
+	runes := []rune(value)
+	if len(runes) < 1 || len(runes) > 24 {
+		return false
+	}
+	for _, item := range runes {
+		if unicode.IsControl(item) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +288,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
+	if !s.requireAllowedClientVersion(w, r) {
+		return
+	}
 	_, _ = s.db.ExecContext(r.Context(), `UPDATE users SET last_login_at = NOW(3) WHERE id = ?`, userID)
 	s.respondWithAccessToken(w, userID, request.Username, http.StatusOK)
 }
@@ -206,13 +302,15 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 		return
 	}
 	var isSuperAdmin uint8
-	_ = s.db.QueryRow(`SELECT is_super_admin FROM users WHERE id = ?`, userID).Scan(&isSuperAdmin)
+	var nickname string
+	_ = s.db.QueryRow(`SELECT nickname, is_super_admin FROM users WHERE id = ?`, userID).Scan(&nickname, &isSuperAdmin)
 	writeJSON(w, status, map[string]any{
 		"accessToken": token,
 		"expiresAt":   expiresAt.UnixMilli(),
 		"user": map[string]any{
 			"id":           userID,
 			"username":     username,
+			"nickname":     nickname,
 			"isSuperAdmin": isSuperAdmin == 1,
 		},
 	})
@@ -249,27 +347,37 @@ func (s *Server) handleBindClient(w http.ResponseWriter, r *http.Request) {
 		`UPDATE monitor_sessions SET last_publish_at = NOW(3) WHERE id = ?`,
 		sessionID,
 	)
+	var roleName string
+	_ = s.db.QueryRowContext(
+		r.Context(),
+		`SELECT role_name FROM monitor_sessions WHERE id = ?`,
+		sessionID,
+	).Scan(&roleName)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":       sessionID,
 		"clientId": request.ClientID,
 		"name":     clientName,
+		"roleName": roleName,
 	})
 }
 
 func (s *Server) handleClientAuthorization(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAllowedClientVersion(w, r) {
+		return
+	}
 	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
 	if len(clientID) < 8 || len(clientID) > 64 {
 		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
 		return
 	}
-	var exists int
+	var sessionID, clientName, roleName string
 	err := s.db.QueryRowContext(
 		r.Context(),
-		`SELECT 1 FROM monitor_sessions
+		`SELECT id, name, role_name FROM monitor_sessions
 		 WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
 		mustUser(r.Context()).ID,
 		clientID,
-	).Scan(&exists)
+	).Scan(&sessionID, &clientName, &roleName)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusForbidden, "client_unbound", "当前客户端已被管理员解绑，请重新登录")
 		return
@@ -278,14 +386,20 @@ func (s *Server) handleClientAuthorization(w http.ResponseWriter, r *http.Reques
 		s.internalError(w, "check client authorization failed", err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": sessionID, "clientId": clientID, "name": clientName, "roleName": roleName,
+	})
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAllowedClientVersion(w, r) {
+		return
+	}
 	user := mustUser(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":           user.ID,
 		"username":     user.Username,
+		"nickname":     user.Nickname,
 		"isSuperAdmin": user.IsSuperAdmin,
 	})
 }
@@ -405,6 +519,9 @@ func (s *Server) ensureDeviceSession(
 }
 
 func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAllowedClientVersion(w, r) {
+		return
+	}
 	user := mustUser(r.Context())
 	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
 	if len(clientID) < 8 || len(clientID) > 64 {
@@ -507,6 +624,24 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						`UPDATE monitor_sessions SET mode = ?, running = ?, last_publish_at = NOW(3) WHERE id = ?`,
 						state.Mode, state.Running, sessionID,
 					)
+				}
+			}
+			if envelope.Type == protocol.TypeTeamJoined {
+				var joined protocol.TeamJoinedPayload
+				if json.Unmarshal(envelope.Payload, &joined) == nil {
+					result, updateErr := s.db.ExecContext(
+						r.Context(),
+						`UPDATE rope_team_members rtm
+						 JOIN rope_teams rt ON rt.id = rtm.team_id
+						 SET rtm.joined = 1, rtm.joined_at = NOW(3)
+						 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
+						joined.TeamID, sessionID, user.ID,
+					)
+					if updateErr == nil {
+						if affected, _ := result.RowsAffected(); affected > 0 {
+							s.hub.NotifyClients(user.ID)
+						}
+					}
 				}
 			}
 		case command, ok := <-controls:
@@ -634,19 +769,20 @@ func (s *Server) authenticateToken(w http.ResponseWriter, r *http.Request, raw s
 		return authenticatedUser{}, false
 	}
 	var activeUsername string
+	var nickname string
 	var isSuperAdmin uint8
 	if err := s.db.QueryRowContext(
 		r.Context(),
-		`SELECT username, is_super_admin FROM users WHERE id = ? AND status = 1 LIMIT 1`,
+		`SELECT username, nickname, is_super_admin FROM users WHERE id = ? AND status = 1 LIMIT 1`,
 		userID,
-	).Scan(&activeUsername, &isSuperAdmin); err != nil {
+	).Scan(&activeUsername, &nickname, &isSuperAdmin); err != nil {
 		writeError(w, http.StatusUnauthorized, "account_disabled", "账号不可用，请重新登录")
 		return authenticatedUser{}, false
 	}
 	if activeUsername != "" {
 		username = activeUsername
 	}
-	return authenticatedUser{ID: userID, Username: username, IsSuperAdmin: isSuperAdmin == 1}, true
+	return authenticatedUser{ID: userID, Username: username, Nickname: nickname, IsSuperAdmin: isSuperAdmin == 1}, true
 }
 
 func (s *Server) requireSuperAdmin(next http.Handler) http.Handler {

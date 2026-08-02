@@ -1,5 +1,9 @@
 # AutoBuff Monitor Server
 
+桌面客户端登录时上报平台和版本。服务端会自动登记新版本，超级管理员可在网页端启用或禁用指定的 macOS、Windows 版本；禁用版本会被拒绝登录并提示更新。
+
+注册邀请码固定为 6 位大写字母和数字；旧的长邀请码不再接受，超级管理员可在网页端删除邀请码记录。
+
 AutoBuff 远程控制与纯标注监控的 Go 服务端。一个账号可以登录多台客户端，每台
 客户端拥有独立监控通道和全局唯一的趣味名称。
 
@@ -55,8 +59,12 @@ ALLOW_REGISTRATION=true
 
 改成 `false` 并重启服务后，注册接口会返回 `403`，已有账号仍可登录。
 
-网页注册还必须提交 `inviteCode`。当前固定邀请码为 `XIAOXIN`，服务端会
-忽略首尾空格和大小写；缺少或错误的邀请码统一返回 `403`。
+网页注册还必须提交 `inviteCode`。邀请码由超级管理员在网页“注册邀请码”页面
+生成，每个邀请码只能成功注册一次，并且只能在设定的有效期内使用；默认有效期
+为 30 分钟。服务端忽略邀请码首尾空格和大小写。
+
+注册时还必须填写 1–24 个字符的昵称。用户名只用于登录，网页和客户端公开
+展示昵称。既有数据库升级时执行 `migrations/user_nickname_migration.sql`。
 
 ## API
 
@@ -73,12 +81,16 @@ ALLOW_REGISTRATION=true
 - `GET /api/admin/users/{id}/clients`（超级管理员查看用户已绑定客户端）
 - `DELETE /api/admin/users/{id}/clients/{sessionId}`（超级管理员解绑客户端）
 - `PATCH /api/admin/users/{id}/client-limit`（超级管理员设置客户端数量上限）
+- `GET /api/admin/invite-codes`（超级管理员查看最近生成的邀请码）
+- `POST /api/admin/invite-codes`（超级管理员生成一次性限时邀请码）
 - `GET /api/admin/maps`（超级管理员浏览云端地图库元数据）
 - `POST /api/admin/maps`（超级管理员上传/更新地图标注）
 - `GET /api/admin/maps/{id}`（超级管理员按需下载单张地图）
+- `DELETE /api/admin/maps/{id}`（超级管理员删除云端地图）
 - `GET /api/healthz`
 - `GET /ws/device?client_id=...`（客户端设备与控制通道）
 - `GET /ws/clients?access_token=...`（网页客户端管理通道）
+- `GET / PUT / DELETE /api/rope-team`（每个账号唯一的挂绳队伍；删除时通知在线队长退出队伍）
 - `GET /ws/view?access_token=...&client_id=...`（指定客户端的监控通道）
 - `GET /api/notifications/bark`
 - `PUT /api/notifications/exp-stalled`

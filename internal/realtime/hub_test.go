@@ -325,6 +325,40 @@ func TestSnapshotIncludesLatestRune(t *testing.T) {
 	}
 }
 
+func TestLatestVerificationAndSnapshotTrackMostRecentReport(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	detach := hub.AttachPublisher("session-verification", "publisher-1")
+	defer detach()
+
+	payload := json.RawMessage(`{"detected":true,"confidence":0.93,"detectedAt":1769000000000}`)
+	hub.Publish("session-verification", protocol.Envelope{
+		Type:    protocol.TypeVerification,
+		Payload: payload,
+	}, nil)
+
+	latest, online, ok := hub.LatestVerification("session-verification")
+	if !ok || !online || !latest.Detected {
+		t.Fatalf("expected active verification, got ok=%v online=%v payload=%+v", ok, online, latest)
+	}
+
+	channel, unsubscribe := hub.Subscribe("session-verification", "viewer-1")
+	defer unsubscribe()
+	select {
+	case message := <-channel:
+		var snapshot protocol.Snapshot
+		if err := json.Unmarshal(message, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if string(snapshot.Verification) != string(payload) {
+			t.Fatalf("expected verification payload %s, got %s", payload, snapshot.Verification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for verification snapshot")
+	}
+}
+
 func TestLatestZoneTracksMostRecentReport(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

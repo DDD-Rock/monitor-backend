@@ -9,22 +9,23 @@ import (
 )
 
 type Room struct {
-	mu           sync.RWMutex
-	publisher    string
-	userID       int64
-	controls     chan []byte
-	viewers      map[string]chan []byte
-	latestMap    json.RawMessage
-	latestFrame  json.RawMessage
-	latestStatus json.RawMessage
-	latestEXP    json.RawMessage
-	latestRune   json.RawMessage
-	latestZone   json.RawMessage
-	latestGain   json.RawMessage
-	clientState  protocol.ClientStatePayload
-	connected    bool
-	online       bool
-	updatedAt    int64
+	mu                 sync.RWMutex
+	publisher          string
+	userID             int64
+	controls           chan []byte
+	viewers            map[string]chan []byte
+	latestMap          json.RawMessage
+	latestFrame        json.RawMessage
+	latestStatus       json.RawMessage
+	latestEXP          json.RawMessage
+	latestRune         json.RawMessage
+	latestVerification json.RawMessage
+	latestZone         json.RawMessage
+	latestGain         json.RawMessage
+	clientState        protocol.ClientStatePayload
+	connected          bool
+	online             bool
+	updatedAt          int64
 }
 
 type Hub struct {
@@ -121,6 +122,8 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 		room.latestEXP = append(room.latestEXP[:0], envelope.Payload...)
 	case protocol.TypeRune:
 		room.latestRune = append(room.latestRune[:0], envelope.Payload...)
+	case protocol.TypeVerification:
+		room.latestVerification = append(room.latestVerification[:0], envelope.Payload...)
 	case protocol.TypeZone:
 		room.latestZone = append(room.latestZone[:0], envelope.Payload...)
 	case protocol.TypeGain:
@@ -352,6 +355,30 @@ func (h *Hub) LatestRune(sessionID string) (protocol.RunePayload, bool, bool) {
 	return payload, online, true
 }
 
+// LatestVerification 返回会话最近一次上报的鼠标跟随验证状态。
+func (h *Hub) LatestVerification(
+	sessionID string,
+) (protocol.VerificationPayload, bool, bool) {
+	h.mu.Lock()
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if room == nil {
+		return protocol.VerificationPayload{}, false, false
+	}
+	room.mu.RLock()
+	raw := append(json.RawMessage(nil), room.latestVerification...)
+	online := room.online
+	room.mu.RUnlock()
+	if len(raw) == 0 {
+		return protocol.VerificationPayload{}, online, false
+	}
+	var payload protocol.VerificationPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return protocol.VerificationPayload{}, online, false
+	}
+	return payload, online, true
+}
+
 // LatestZone 返回会话最近一次上报的安全区状态、发布端是否在线，以及是否有过上报。
 func (h *Hub) LatestZone(sessionID string) (protocol.ZonePayload, bool, bool) {
 	h.mu.Lock()
@@ -378,16 +405,17 @@ func (r *Room) snapshot() protocol.Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return protocol.Snapshot{
-		Type:      protocol.TypeSnapshot,
-		Online:    r.online,
-		Map:       append(json.RawMessage(nil), r.latestMap...),
-		Frame:     append(json.RawMessage(nil), r.latestFrame...),
-		Status:    append(json.RawMessage(nil), r.latestStatus...),
-		EXP:       append(json.RawMessage(nil), r.latestEXP...),
-		Rune:      append(json.RawMessage(nil), r.latestRune...),
-		Zone:      append(json.RawMessage(nil), r.latestZone...),
-		Gain:      append(json.RawMessage(nil), r.latestGain...),
-		UpdatedAt: r.updatedAt,
+		Type:         protocol.TypeSnapshot,
+		Online:       r.online,
+		Map:          append(json.RawMessage(nil), r.latestMap...),
+		Frame:        append(json.RawMessage(nil), r.latestFrame...),
+		Status:       append(json.RawMessage(nil), r.latestStatus...),
+		EXP:          append(json.RawMessage(nil), r.latestEXP...),
+		Rune:         append(json.RawMessage(nil), r.latestRune...),
+		Verification: append(json.RawMessage(nil), r.latestVerification...),
+		Zone:         append(json.RawMessage(nil), r.latestZone...),
+		Gain:         append(json.RawMessage(nil), r.latestGain...),
+		UpdatedAt:    r.updatedAt,
 	}
 }
 

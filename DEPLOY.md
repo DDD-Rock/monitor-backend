@@ -50,13 +50,24 @@ mysql -u root -p autobuff_monitor < exp_gain_migration.sql
 mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
 ```
 
+挂绳组队与角色名称功能升级还需执行：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/rope_party_migration.sql
+```
+
 先执行数据库迁移，再替换并重启后端；旧后端不认识新增客户端协议。
 
 云端地图标注功能还需执行一次：
 
 ```bash
 mysql -u root -p autobuff_monitor < migrations/cloud_maps_migration.sql
+mysql -u root -p autobuff_monitor < migrations/client_version_policies_migration.sql
+mysql -u root -p autobuff_monitor < migrations/invite_codes_migration.sql
 ```
+
+执行邀请码迁移并部署新版后端后，旧的固定邀请码 `XIAOXIN` 不再有效；需要由
+超级管理员登录网页生成新的一次性邀请码。
 
 ## 升级步骤
 
@@ -115,3 +126,12 @@ BARK_PUBLIC_URL=http://106.52.208.129:29687
 首次升级需执行 `migrations/bark_notification_migration.sql`。Bark DeviceKey
 使用 JWT 服务端密钥派生的 AES-GCM 密钥加密保存，因此轮换 `JWT_SECRET`
 之前必须同步迁移已经保存的通知凭证。
+
+符文和鼠标跟随紧急警报静音开关首次上线前还需执行：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/urgent_alert_mute_migration.sql
+```
+
+该迁移必须先于新版后端执行，否则通知设置接口会因缺少
+`urgent_alerts_muted` 字段而失败。

@@ -17,7 +17,7 @@ func TestValidateEnvelopeAcceptsFrame(t *testing.T) {
 }
 
 func TestValidateEnvelopeAcceptsEXP(t *testing.T) {
-	message := []byte(`{"type":"exp","sequence":2,"payload":{"currentEXP":123456,"percent":42.125,"confidence":0.96,"status":"已识别 EXP","recognizedAt":1}}`)
+	message := []byte(`{"type":"exp","sequence":2,"payload":{"currentEXP":123456,"percent":42.125,"confidence":0.96,"recognitionMethod":"ppOCRv4","status":"已识别 EXP","recognizedAt":1}}`)
 	if _, err := ValidateEnvelope(message); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,31 @@ func TestValidateEnvelopeRejectsMalformedRuneAlert(t *testing.T) {
 	for name, message := range cases {
 		if _, err := ValidateEnvelope([]byte(message)); err == nil {
 			t.Fatalf("expected %s 的符文消息被拒绝", name)
+		}
+	}
+}
+
+func TestValidateEnvelopeAcceptsMouseFollowVerification(t *testing.T) {
+	detected := []byte(`{"type":"verification","sequence":5,"payload":{"detected":true,"confidence":0.91,"detectedAt":1769000000000}}`)
+	if _, err := ValidateEnvelope(detected); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared := []byte(`{"type":"verification","sequence":6,"payload":{"detected":false,"confidence":null,"detectedAt":1769000005000}}`)
+	if _, err := ValidateEnvelope(cleared); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateEnvelopeRejectsMalformedMouseFollowVerification(t *testing.T) {
+	cases := map[string]string{
+		"缺少时间戳":    `{"type":"verification","sequence":1,"payload":{"detected":true,"confidence":0.8,"detectedAt":0}}`,
+		"置信度越界":    `{"type":"verification","sequence":1,"payload":{"detected":true,"confidence":1.2,"detectedAt":1769000000000}}`,
+		"已解除却带置信度": `{"type":"verification","sequence":1,"payload":{"detected":false,"confidence":0.8,"detectedAt":1769000000000}}`,
+	}
+	for name, message := range cases {
+		if _, err := ValidateEnvelope([]byte(message)); err == nil {
+			t.Fatalf("expected %s 的鼠标跟随验证消息被拒绝", name)
 		}
 	}
 }
@@ -105,5 +130,31 @@ func TestValidateEnvelopeAcceptsClientState(t *testing.T) {
 	}
 	if envelope.Type != TypeClientState {
 		t.Fatalf("expected %s, got %s", TypeClientState, envelope.Type)
+	}
+}
+
+func TestValidateEnvelopeAcceptsTempleClientState(t *testing.T) {
+	message := []byte(`{"type":"client_state","sequence":1,"payload":{"mode":"temple","running":true}}`)
+	if _, err := ValidateEnvelope(message); err != nil {
+		t.Fatalf("expected temple client state to remain connected, got %v", err)
+	}
+}
+
+func TestValidateEnvelopeAcceptsTeamJoined(t *testing.T) {
+	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色"}}`)
+	if _, err := ValidateEnvelope(message); err != nil {
+		t.Fatalf("expected valid team joined receipt, got %v", err)
+	}
+}
+
+func TestValidateEnvelopeRejectsInvalidTeamJoined(t *testing.T) {
+	cases := []string{
+		`{"type":"team_joined","sequence":2,"payload":{"teamId":0,"roleName":"测试角色"}}`,
+		`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":""}}`,
+	}
+	for _, message := range cases {
+		if _, err := ValidateEnvelope([]byte(message)); err == nil {
+			t.Fatal("expected invalid team joined receipt to be rejected")
+		}
 	}
 }

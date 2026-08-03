@@ -679,25 +679,7 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
-	var sessionID string
-	var err error
-	if clientID != "" {
-		err = s.db.QueryRowContext(
-			r.Context(),
-			`SELECT id FROM monitor_sessions WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
-			user.ID, clientID,
-		).Scan(&sessionID)
-	} else if activeSessionID, active := s.hub.ActiveMonitorSession(user.ID); active {
-		sessionID = activeSessionID
-	} else {
-		err = s.db.QueryRowContext(
-			r.Context(),
-			`SELECT id FROM monitor_sessions WHERE user_id = ? AND status = 1
-			 ORDER BY last_publish_at DESC, created_at DESC LIMIT 1`,
-			user.ID,
-		).Scan(&sessionID)
-	}
+	sessionID, err := s.viewerSession(r.Context(), user.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "client_not_found", "尚未找到可监控的客户端")
 		return
@@ -715,13 +697,27 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 	connectionContext := connection.CloseRead(r.Context())
 
 	viewerID, _ := randomUUID()
-	messages, unsubscribe := s.hub.Subscribe(sessionID, viewerID)
-	defer unsubscribe()
+	messages, unsubscribeViewer := s.hub.Subscribe(sessionID, viewerID)
+	defer func() { unsubscribeViewer() }()
+
+	updates, unsubscribeUpdates := s.hub.SubscribeClients(user.ID, viewerID)
+	defer unsubscribeUpdates()
 
 	pingTicker := time.NewTicker(25 * time.Second)
 	defer pingTicker.Stop()
 	for {
 		select {
+		case _, ok := <-updates:
+			if !ok {
+				return
+			}
+			nextSessionID, resolveErr := s.viewerSession(connectionContext, user.ID)
+			if resolveErr != nil || nextSessionID == sessionID {
+				continue
+			}
+			unsubscribeViewer()
+			sessionID = nextSessionID
+			messages, unsubscribeViewer = s.hub.Subscribe(sessionID, viewerID)
 		case message, ok := <-messages:
 			if !ok {
 				return
@@ -743,6 +739,23 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// viewerSession resolves the single account-level monitor channel. The in-memory
+// active claim wins; the most recently publishing bound client is only the
+// offline fallback while no client is actively monitoring.
+func (s *Server) viewerSession(ctx context.Context, userID int64) (string, error) {
+	if sessionID, active := s.hub.ActiveMonitorSession(userID); active {
+		return sessionID, nil
+	}
+	var sessionID string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id FROM monitor_sessions WHERE user_id = ? AND status = 1
+		 ORDER BY last_publish_at DESC, created_at DESC LIMIT 1`,
+		userID,
+	).Scan(&sessionID)
+	return sessionID, err
 }
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {

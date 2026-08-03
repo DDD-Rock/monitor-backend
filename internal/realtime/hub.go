@@ -134,9 +134,14 @@ func (h *Hub) Publish(sessionID string, envelope protocol.Envelope, raw []byte) 
 	}
 	room.updatedAt = time.Now().UnixMilli()
 	room.mu.Unlock()
-	room.broadcast(raw)
 	if envelope.Type == protocol.TypeClientState {
+		// Viewers need the derived online/connected state, not just the raw
+		// client_state payload. Broadcasting a snapshot also removes message-order
+		// races with status.online.
+		room.broadcastSnapshot()
 		h.notifyClientObservers(room.userID)
+	} else {
+		room.broadcast(raw)
 	}
 	return true
 }
@@ -232,6 +237,23 @@ func (h *Hub) ClientStatus(sessionID string) (online bool, state protocol.Client
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 	return room.connected, room.clientState, room.updatedAt
+}
+
+// ActiveMonitorSession returns the in-memory session that currently owns the
+// user's monitor slot. Database timestamps are only a fallback for users with
+// no active monitor connection.
+func (h *Hub) ActiveMonitorSession(userID int64) (string, bool) {
+	h.mu.Lock()
+	sessionID := h.activeMonitors[userID]
+	room := h.rooms[sessionID]
+	h.mu.Unlock()
+	if sessionID == "" || room == nil {
+		return "", false
+	}
+	room.mu.RLock()
+	active := room.connected && room.online && room.userID == userID
+	room.mu.RUnlock()
+	return sessionID, active
 }
 
 func (h *Hub) SubscribeClients(userID int64, observerID string) (<-chan struct{}, func()) {
@@ -404,9 +426,16 @@ func (h *Hub) LatestZone(sessionID string) (protocol.ZonePayload, bool, bool) {
 func (r *Room) snapshot() protocol.Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	var clientState *protocol.ClientStatePayload
+	if r.clientState.Mode != "" {
+		state := r.clientState
+		clientState = &state
+	}
 	return protocol.Snapshot{
 		Type:         protocol.TypeSnapshot,
 		Online:       r.online,
+		Connected:    r.connected,
+		ClientState:  clientState,
 		Map:          append(json.RawMessage(nil), r.latestMap...),
 		Frame:        append(json.RawMessage(nil), r.latestFrame...),
 		Status:       append(json.RawMessage(nil), r.latestStatus...),

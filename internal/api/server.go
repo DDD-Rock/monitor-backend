@@ -688,6 +688,8 @@ func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request) {
 			`SELECT id FROM monitor_sessions WHERE user_id = ? AND client_id = ? AND status = 1 LIMIT 1`,
 			user.ID, clientID,
 		).Scan(&sessionID)
+	} else if activeSessionID, active := s.hub.ActiveMonitorSession(user.ID); active {
+		sessionID = activeSessionID
 	} else {
 		err = s.db.QueryRowContext(
 			r.Context(),

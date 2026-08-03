@@ -92,6 +92,48 @@ func TestClientConnectionDoesNotMarkStoppedMonitorOnline(t *testing.T) {
 	}
 }
 
+func TestClientStateBroadcastsDerivedSnapshotAndTracksActiveMonitor(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	_, detach := hub.AttachDevice("session-1", 42, "publisher-1")
+	channel, unsubscribe := hub.Subscribe("session-1", "viewer-1")
+	defer unsubscribe()
+	<-channel // Initial connected-but-stopped snapshot.
+
+	active := protocol.Envelope{
+		Type:    protocol.TypeClientState,
+		Payload: json.RawMessage(`{"mode":"monitor","running":true}`),
+	}
+	if !hub.Publish("session-1", active, nil) {
+		t.Fatal("expected monitor state to be accepted")
+	}
+
+	select {
+	case message := <-channel:
+		var snapshot protocol.Snapshot
+		if err := json.Unmarshal(message, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Type != protocol.TypeSnapshot || !snapshot.Connected || !snapshot.Online {
+			t.Fatalf("unexpected derived snapshot: %+v", snapshot)
+		}
+		if snapshot.ClientState == nil || snapshot.ClientState.Mode != "monitor" || !snapshot.ClientState.Running {
+			t.Fatalf("missing active client state: %+v", snapshot.ClientState)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for derived client-state snapshot")
+	}
+
+	if sessionID, ok := hub.ActiveMonitorSession(42); !ok || sessionID != "session-1" {
+		t.Fatalf("active monitor = %q, %v; want session-1, true", sessionID, ok)
+	}
+	detach()
+	if sessionID, ok := hub.ActiveMonitorSession(42); ok || sessionID != "" {
+		t.Fatalf("active monitor after detach = %q, %v; want empty, false", sessionID, ok)
+	}
+}
+
 func TestOnlyOneDevicePerUserCanRunMonitorMode(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

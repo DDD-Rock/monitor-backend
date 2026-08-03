@@ -162,17 +162,19 @@ type Envelope struct {
 }
 
 type Snapshot struct {
-	Type         string          `json:"type"`
-	Online       bool            `json:"online"`
-	Map          json.RawMessage `json:"map,omitempty"`
-	Frame        json.RawMessage `json:"frame,omitempty"`
-	Status       json.RawMessage `json:"status,omitempty"`
-	EXP          json.RawMessage `json:"exp,omitempty"`
-	Rune         json.RawMessage `json:"rune,omitempty"`
-	Verification json.RawMessage `json:"verification,omitempty"`
-	Zone         json.RawMessage `json:"zone,omitempty"`
-	Gain         json.RawMessage `json:"gain,omitempty"`
-	UpdatedAt    int64           `json:"updatedAt"`
+	Type         string              `json:"type"`
+	Online       bool                `json:"online"`
+	Connected    bool                `json:"connected"`
+	ClientState  *ClientStatePayload `json:"clientState,omitempty"`
+	Map          json.RawMessage     `json:"map,omitempty"`
+	Frame        json.RawMessage     `json:"frame,omitempty"`
+	Status       json.RawMessage     `json:"status,omitempty"`
+	EXP          json.RawMessage     `json:"exp,omitempty"`
+	Rune         json.RawMessage     `json:"rune,omitempty"`
+	Verification json.RawMessage     `json:"verification,omitempty"`
+	Zone         json.RawMessage     `json:"zone,omitempty"`
+	Gain         json.RawMessage     `json:"gain,omitempty"`
+	UpdatedAt    int64               `json:"updatedAt"`
 }
 
 func ValidateEnvelope(message []byte) (Envelope, error) {

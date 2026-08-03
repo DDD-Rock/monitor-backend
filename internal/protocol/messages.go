@@ -99,7 +99,7 @@ type EXPPayload struct {
 	RecognizedAt      int64    `json:"recognizedAt"`
 }
 
-// RunePayload 描述 Mac 端对「符文诅咒提示横幅」的识别结果。
+// RunePayload 描述客户端对「符文诅咒提示横幅」的识别结果。
 // Detected 为 true 表示画面上仍挂着紫色符文提示，需要尽快解除。
 type RunePayload struct {
 	Detected   bool     `json:"detected"`
@@ -107,7 +107,7 @@ type RunePayload struct {
 	DetectedAt int64    `json:"detectedAt"`
 }
 
-// VerificationPayload 描述 Mac 端对「寻找透明图形」鼠标跟随验证弹窗的识别结果。
+// VerificationPayload 描述客户端对「寻找透明图形」鼠标跟随验证弹窗的识别结果。
 type VerificationPayload struct {
 	Detected   bool     `json:"detected"`
 	Confidence *float64 `json:"confidence"`

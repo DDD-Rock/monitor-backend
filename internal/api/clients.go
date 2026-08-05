@@ -384,6 +384,82 @@ func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleRemoveRopeTeamMember(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionId"))
+	if len(sessionID) != 36 {
+		writeError(w, http.StatusBadRequest, "invalid_session_id", "队伍成员编号无效")
+		return
+	}
+
+	userID := mustUser(r.Context()).ID
+	var teamID int64
+	var leaderSessionID string
+	var roleName string
+	err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT rt.id, rt.leader_session_id, ms.role_name
+		 FROM rope_teams rt
+		 JOIN rope_team_members rtm ON rtm.team_id = rt.id
+		 JOIN monitor_sessions ms ON ms.id = rtm.session_id
+		 WHERE rt.user_id = ? AND rtm.session_id = ? AND ms.status = 1
+		 LIMIT 1`,
+		userID, sessionID,
+	).Scan(&teamID, &leaderSessionID, &roleName)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "rope_team_member_not_found", "该成员不在当前挂绳队伍中")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "load rope team member for removal failed", err)
+		return
+	}
+	if sessionID == leaderSessionID {
+		writeError(w, http.StatusBadRequest, "cannot_remove_team_leader", "不能直接移除队长，请先修改队长或解散队伍")
+		return
+	}
+	if !validRoleName(roleName) {
+		writeError(w, http.StatusConflict, "invalid_member_role_name", "成员角色名称无效，无法发送踢出指令")
+		return
+	}
+	if online, _, _ := s.hub.ClientStatus(leaderSessionID); !online {
+		writeError(w, http.StatusConflict, "team_leader_offline", "队长客户端必须在线才能移除成员")
+		return
+	}
+	if !s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+		Type:           "command",
+		Action:         "remove_rope_party_member",
+		TeamID:         teamID,
+		TargetRoleName: roleName,
+	}) {
+		writeError(w, http.StatusConflict, "team_leader_unavailable", "队长客户端暂时无法接收移除指令，请稍后重试")
+		return
+	}
+
+	result, err := s.db.ExecContext(
+		r.Context(),
+		`DELETE rtm FROM rope_team_members rtm
+		 JOIN rope_teams rt ON rt.id = rtm.team_id
+		 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
+		teamID, sessionID, userID,
+	)
+	if err != nil {
+		s.internalError(w, "remove rope team member failed", err)
+		return
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		writeError(w, http.StatusNotFound, "rope_team_member_not_found", "该成员不在当前挂绳队伍中")
+		return
+	}
+	s.hub.NotifyClients(userID)
+	team, loadErr := s.ropeTeam(r.Context(), userID)
+	if loadErr != nil {
+		s.internalError(w, "reload rope team after member removal failed", loadErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"team": team})
+}
+
 func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	items, err := s.clientItems(r.Context(), mustUser(r.Context()).ID)
 	if err != nil {

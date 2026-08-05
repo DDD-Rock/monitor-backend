@@ -92,6 +92,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PUT /api/clients/role-name", s.requireAuth(http.HandlerFunc(s.handleSaveClientRoleName)))
 	mux.Handle("GET /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleRopeTeam)))
 	mux.Handle("PUT /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeam)))
+	mux.Handle("DELETE /api/rope-team/members/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleRemoveRopeTeamMember)))
 	mux.Handle("DELETE /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleDeleteRopeTeam)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
 	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))

@@ -82,6 +82,7 @@ type ClientCommand struct {
 	IsLeader        bool     `json:"isLeader,omitempty"`
 	FirstCreation   bool     `json:"firstCreation,omitempty"`
 	RoleName        string   `json:"roleName,omitempty"`
+	TargetRoleName  string   `json:"targetRoleName,omitempty"`
 	InviteRoleNames []string `json:"inviteRoleNames,omitempty"`
 }
 

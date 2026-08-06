@@ -6,7 +6,7 @@ SET @monitor_schema = DATABASE();
 SET @add_max_client_count_sql = (
     SELECT IF(
         COUNT(*) = 0,
-        'ALTER TABLE `users` ADD COLUMN `max_client_count` INT UNSIGNED NOT NULL DEFAULT 2 COMMENT ''maximum number of bound computers'' AFTER `is_super_admin`',
+        'ALTER TABLE `users` ADD COLUMN `max_client_count` INT UNSIGNED NOT NULL DEFAULT 5 COMMENT ''maximum number of bound computers'' AFTER `is_super_admin`',
         'SELECT 1'
     )
     FROM information_schema.columns
@@ -20,7 +20,7 @@ DEALLOCATE PREPARE add_max_client_count_stmt;
 
 -- 只修改后续新注册账号使用的默认值；已有账号当前配置保持不变。
 ALTER TABLE `users`
-    MODIFY COLUMN `max_client_count` INT UNSIGNED NOT NULL DEFAULT 2
+    MODIFY COLUMN `max_client_count` INT UNSIGNED NOT NULL DEFAULT 5
         COMMENT 'maximum number of bound computers';
 
 -- 如需保留某个现有账号当前已经绑定的全部客户端，可在上线前按实际数量调整：

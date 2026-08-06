@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS `users` (
     `password_hash` VARCHAR(255) NOT NULL,
     `status` TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '1=active, 0=disabled',
     `is_super_admin` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0=no, 1=yes; database-only setting',
-    `max_client_count` INT UNSIGNED NOT NULL DEFAULT 2 COMMENT 'maximum number of bound computers',
+    `max_client_count` INT UNSIGNED NOT NULL DEFAULT 5 COMMENT 'maximum number of bound computers',
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     `last_login_at` DATETIME(3) NULL,

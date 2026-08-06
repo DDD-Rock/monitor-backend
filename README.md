@@ -50,7 +50,7 @@ go run ./cmd/server
 
 服务默认只监听 `127.0.0.1:28672`，由 Nginx 的公网端口 `28671` 代理。
 
-当前 AutoBuff 默认连接 `http://106.52.208.129:28671`。这是开发联调地址；上线前应切换到 HTTPS/WSS。
+当前 AutoBuff 默认连接 `https://buff.juanwang.cc`，WebSocket 自动使用 `wss://buff.juanwang.cc`。
 
 ## 开关注册
 

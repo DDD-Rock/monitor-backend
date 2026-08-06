@@ -32,7 +32,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		ListenAddr:        valueOrDefault("LISTEN_ADDR", "127.0.0.1:28672"),
-		PublicBaseURL:     strings.TrimRight(valueOrDefault("PUBLIC_BASE_URL", "http://106.52.208.129:28671"), "/"),
+		PublicBaseURL:     strings.TrimRight(valueOrDefault("PUBLIC_BASE_URL", "https://buff.juanwang.cc"), "/"),
 		DatabaseDSN:       os.Getenv("DATABASE_DSN"),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		JWTTTL:            ttl,

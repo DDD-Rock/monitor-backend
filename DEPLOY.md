@@ -48,6 +48,7 @@ mysql -u root -p autobuff_monitor < exp_gain_migration.sql
 
 ```bash
 mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
+mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration.sql
 ```
 
 挂绳组队与角色名称功能升级还需执行：

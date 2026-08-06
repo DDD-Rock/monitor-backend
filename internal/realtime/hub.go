@@ -202,6 +202,15 @@ func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool
 // DisconnectDevice sends an unbind command and then asks the websocket handler
 // to close the active connection. A nil frame is internal-only.
 func (h *Hub) DisconnectDevice(sessionID string) bool {
+	return h.disconnectDevice(sessionID, "unbind", "")
+}
+
+// KickDevice ends the current login session without revoking the computer.
+func (h *Hub) KickDevice(sessionID string) bool {
+	return h.disconnectDevice(sessionID, "kick", "管理员已将当前客户端踢下线")
+}
+
+func (h *Hub) disconnectDevice(sessionID, action, reason string) bool {
 	h.mu.Lock()
 	room := h.rooms[sessionID]
 	h.mu.Unlock()
@@ -215,7 +224,7 @@ func (h *Hub) DisconnectDevice(sessionID string) bool {
 	if !connected || controls == nil {
 		return false
 	}
-	command, err := json.Marshal(protocol.ClientCommand{Type: "command", Action: "unbind"})
+	command, err := json.Marshal(protocol.ClientCommand{Type: "command", Action: action, Reason: reason})
 	if err != nil {
 		return false
 	}

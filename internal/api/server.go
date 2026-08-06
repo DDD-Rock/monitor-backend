@@ -100,15 +100,17 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
 	mux.Handle("GET /api/admin/users/{id}/clients", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClients)))
 	mux.Handle("DELETE /api/admin/users/{id}/clients/{sessionId}", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminDeleteUserClient)))
+	mux.Handle("PUT /api/admin/users/{id}/authorized-modes", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserAuthorizedModes)))
+	mux.Handle("POST /api/admin/users/{id}/clients/kick", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminKickUserClients)))
 	mux.Handle("PATCH /api/admin/users/{id}/client-limit", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserClientLimit)))
 	mux.Handle("GET /api/admin/invite-codes", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminInviteCodes)))
 	mux.Handle("POST /api/admin/invite-codes", s.requireSuperAdmin(http.HandlerFunc(s.handleCreateAdminInviteCode)))
 	mux.Handle("DELETE /api/admin/invite-codes/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDeleteAdminInviteCode)))
 	mux.Handle("GET /api/admin/client-versions", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminClientVersions)))
 	mux.Handle("PUT /api/admin/client-versions", s.requireSuperAdmin(http.HandlerFunc(s.handleSaveAdminClientVersion)))
-	mux.Handle("GET /api/admin/maps", s.requireSuperAdmin(http.HandlerFunc(s.handleCloudMaps)))
+	mux.Handle("GET /api/admin/maps", s.requireAuth(http.HandlerFunc(s.handleCloudMaps)))
 	mux.Handle("POST /api/admin/maps", s.requireSuperAdmin(http.HandlerFunc(s.handleUploadCloudMaps)))
-	mux.Handle("GET /api/admin/maps/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDownloadCloudMap)))
+	mux.Handle("GET /api/admin/maps/{id}", s.requireAuth(http.HandlerFunc(s.handleDownloadCloudMap)))
 	mux.Handle("DELETE /api/admin/maps/{id}", s.requireSuperAdmin(http.HandlerFunc(s.handleDeleteCloudMap)))
 	mux.Handle("GET /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleBarkSettings)))
 	mux.Handle("PUT /api/notifications/bark", s.requireAuth(http.HandlerFunc(s.handleSaveBark)))
@@ -303,17 +305,25 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 		s.internalError(w, "issue access token failed", err)
 		return
 	}
-	var isSuperAdmin uint8
+	var permissions userModePermissions
 	var nickname string
-	_ = s.db.QueryRow(`SELECT nickname, is_super_admin FROM users WHERE id = ?`, userID).Scan(&nickname, &isSuperAdmin)
+	_ = s.db.QueryRow(
+		`SELECT nickname, is_super_admin, dead_mode_enabled, live_mode_enabled,
+		        temple_mode_enabled, follow_heal_mode_enabled, monitor_mode_enabled
+		 FROM users WHERE id = ?`, userID,
+	).Scan(
+		&nickname, &permissions.IsSuperAdmin, &permissions.Dead, &permissions.Live,
+		&permissions.Temple, &permissions.FollowHeal, &permissions.Monitor,
+	)
 	writeJSON(w, status, map[string]any{
 		"accessToken": token,
 		"expiresAt":   expiresAt.UnixMilli(),
 		"user": map[string]any{
-			"id":           userID,
-			"username":     username,
-			"nickname":     nickname,
-			"isSuperAdmin": isSuperAdmin == 1,
+			"id":              userID,
+			"username":        username,
+			"nickname":        nickname,
+			"isSuperAdmin":    permissions.IsSuperAdmin == 1,
+			"authorizedModes": permissions.authorizedModes(),
 		},
 	})
 }
@@ -355,11 +365,17 @@ func (s *Server) handleBindClient(w http.ResponseWriter, r *http.Request) {
 		`SELECT role_name FROM monitor_sessions WHERE id = ?`,
 		sessionID,
 	).Scan(&roleName)
+	permissions, err := s.loadUserModePermissions(r.Context(), mustUser(r.Context()).ID)
+	if err != nil {
+		s.internalError(w, "load client mode permissions failed", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":       sessionID,
-		"clientId": request.ClientID,
-		"name":     clientName,
-		"roleName": roleName,
+		"id":              sessionID,
+		"clientId":        request.ClientID,
+		"name":            clientName,
+		"roleName":        roleName,
+		"authorizedModes": permissions.authorizedModes(),
 	})
 }
 
@@ -388,8 +404,14 @@ func (s *Server) handleClientAuthorization(w http.ResponseWriter, r *http.Reques
 		s.internalError(w, "check client authorization failed", err)
 		return
 	}
+	permissions, err := s.loadUserModePermissions(r.Context(), mustUser(r.Context()).ID)
+	if err != nil {
+		s.internalError(w, "load client mode permissions failed", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": sessionID, "clientId": clientID, "name": clientName, "roleName": roleName,
+		"authorizedModes": permissions.authorizedModes(),
 	})
 }
 
@@ -398,11 +420,17 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := mustUser(r.Context())
+	permissions, err := s.loadUserModePermissions(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "load user mode permissions failed", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":           user.ID,
-		"username":     user.Username,
-		"nickname":     user.Nickname,
-		"isSuperAdmin": user.IsSuperAdmin,
+		"id":              user.ID,
+		"username":        user.Username,
+		"nickname":        user.Nickname,
+		"isSuperAdmin":    user.IsSuperAdmin,
+		"authorizedModes": permissions.authorizedModes(),
 	})
 }
 
@@ -525,6 +553,11 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := mustUser(r.Context())
+	permissions, err := s.loadUserModePermissions(r.Context(), user.ID)
+	if err != nil {
+		s.internalError(w, "load device mode permissions failed", err)
+		return
+	}
 	clientID := strings.TrimSpace(r.URL.Query().Get("client_id"))
 	if len(clientID) < 8 || len(clientID) > 64 {
 		writeError(w, http.StatusBadRequest, "invalid_client_id", "客户端标识无效")
@@ -604,7 +637,10 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 			if envelope.Type == protocol.TypeClientState {
 				var state protocol.ClientStatePayload
 				if json.Unmarshal(envelope.Payload, &state) == nil {
-					if !accepted {
+					if !permissions.allows(state.Mode) {
+						state.Running = false
+						s.hub.SendCommand(sessionID, protocol.ClientCommand{Type: "command", Action: "stop", Reason: "mode_unauthorized"})
+					} else if !accepted {
 						state.Running = false
 						s.hub.SendCommand(sessionID, protocol.ClientCommand{
 							Type:   "command",

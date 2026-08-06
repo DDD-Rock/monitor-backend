@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -12,26 +13,89 @@ import (
 )
 
 type adminUserItem struct {
-	ID             int64  `json:"id"`
-	Nickname       string `json:"nickname"`
-	Status         uint8  `json:"status"`
-	IsSuperAdmin   bool   `json:"isSuperAdmin"`
-	CreatedAt      int64  `json:"createdAt"`
-	LastLoginAt    *int64 `json:"lastLoginAt"`
-	ConnectedCount int    `json:"connectedClientCount"`
-	MaxClientCount uint32 `json:"maxClientCount"`
+	ID              int64    `json:"id"`
+	Nickname        string   `json:"nickname"`
+	Status          uint8    `json:"status"`
+	IsSuperAdmin    bool     `json:"isSuperAdmin"`
+	CreatedAt       int64    `json:"createdAt"`
+	LastLoginAt     *int64   `json:"lastLoginAt"`
+	ConnectedCount  int      `json:"connectedClientCount"`
+	MaxClientCount  uint32   `json:"maxClientCount"`
+	AuthorizedModes []string `json:"authorizedModes"`
+}
+
+type userModePermissions struct {
+	IsSuperAdmin uint8
+	Dead         uint8
+	Live         uint8
+	Temple       uint8
+	FollowHeal   uint8
+	Monitor      uint8
+}
+
+func (p userModePermissions) authorizedModes() []string {
+	if p.IsSuperAdmin == 1 {
+		return []string{"dead", "live", "temple", "follow_heal", "monitor"}
+	}
+	modes := make([]string, 0, 5)
+	if p.Dead == 1 {
+		modes = append(modes, "dead")
+	}
+	if p.Live == 1 {
+		modes = append(modes, "live")
+	}
+	if p.Temple == 1 {
+		modes = append(modes, "temple")
+	}
+	if p.FollowHeal == 1 {
+		modes = append(modes, "follow_heal")
+	}
+	if p.Monitor == 1 {
+		modes = append(modes, "monitor")
+	}
+	return modes
+}
+
+func (p userModePermissions) allows(mode string) bool {
+	if p.IsSuperAdmin == 1 {
+		return true
+	}
+	switch mode {
+	case "dead":
+		return p.Dead == 1
+	case "live":
+		return p.Live == 1
+	case "temple":
+		return p.Temple == 1
+	case "follow_heal":
+		return p.FollowHeal == 1
+	case "monitor":
+		return p.Monitor == 1
+	default:
+		return false
+	}
+}
+
+func (s *Server) loadUserModePermissions(ctx context.Context, userID int64) (userModePermissions, error) {
+	var p userModePermissions
+	err := s.db.QueryRowContext(ctx, `SELECT is_super_admin, dead_mode_enabled, live_mode_enabled,
+		temple_mode_enabled, follow_heal_mode_enabled, monitor_mode_enabled FROM users WHERE id = ?`, userID).
+		Scan(&p.IsSuperAdmin, &p.Dead, &p.Live, &p.Temple, &p.FollowHeal, &p.Monitor)
+	return p, err
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(
 		r.Context(),
 		`SELECT u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
-		        u.max_client_count,
+		        u.max_client_count, u.dead_mode_enabled, u.live_mode_enabled, u.temple_mode_enabled,
+		        u.follow_heal_mode_enabled, u.monitor_mode_enabled,
 		        COUNT(CASE WHEN ms.status = 1 AND ms.client_id IS NOT NULL THEN 1 END)
 		 FROM users u
 		 LEFT JOIN monitor_sessions ms ON ms.user_id = u.id
 		 GROUP BY u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
-		          u.max_client_count
+		          u.max_client_count, u.dead_mode_enabled, u.live_mode_enabled, u.temple_mode_enabled,
+		          u.follow_heal_mode_enabled, u.monitor_mode_enabled
 		 ORDER BY u.created_at DESC`,
 	)
 	if err != nil {
@@ -43,16 +107,19 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var item adminUserItem
 		var isSuperAdmin uint8
+		var dead, live, temple, followHeal, monitor uint8
 		var createdAt time.Time
 		var lastLogin sql.NullTime
 		if err := rows.Scan(
 			&item.ID, &item.Nickname, &item.Status, &isSuperAdmin,
-			&createdAt, &lastLogin, &item.MaxClientCount, &item.ConnectedCount,
+			&createdAt, &lastLogin, &item.MaxClientCount, &dead, &live, &temple, &followHeal, &monitor,
+			&item.ConnectedCount,
 		); err != nil {
 			s.internalError(w, "scan users failed", err)
 			return
 		}
 		item.IsSuperAdmin = isSuperAdmin == 1
+		item.AuthorizedModes = userModePermissions{IsSuperAdmin: isSuperAdmin, Dead: dead, Live: live, Temple: temple, FollowHeal: followHeal, Monitor: monitor}.authorizedModes()
 		item.CreatedAt = createdAt.UnixMilli()
 		if lastLogin.Valid {
 			value := lastLogin.Time.UnixMilli()
@@ -151,6 +218,75 @@ func (s *Server) handleAdminUserClientLimit(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAdminUserAuthorizedModes(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requestedUserID(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		Modes []string `json:"modes"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	allowed := map[string]bool{"dead": false, "live": false, "temple": false, "follow_heal": false, "monitor": false}
+	for _, mode := range request.Modes {
+		if _, exists := allowed[mode]; !exists {
+			writeError(w, http.StatusBadRequest, "invalid_mode", "模式授权无效")
+			return
+		}
+		allowed[mode] = true
+	}
+	result, err := s.db.ExecContext(r.Context(), `UPDATE users SET dead_mode_enabled=?, live_mode_enabled=?, temple_mode_enabled=?, follow_heal_mode_enabled=?, monitor_mode_enabled=? WHERE id=?`, boolToUint(allowed["dead"]), boolToUint(allowed["live"]), boolToUint(allowed["temple"]), boolToUint(allowed["follow_heal"]), boolToUint(allowed["monitor"]), userID)
+	if err != nil {
+		s.internalError(w, "update user mode permissions failed", err)
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		writeError(w, http.StatusNotFound, "user_not_found", "用户不存在")
+		return
+	}
+	s.hub.NotifyClients(userID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func boolToUint(value bool) uint8 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func (s *Server) handleAdminKickUserClients(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requestedUserID(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		SessionIDs []string `json:"sessionIds"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	kicked := 0
+	for _, sessionID := range request.SessionIDs {
+		sessionID = strings.TrimSpace(sessionID)
+		if len(sessionID) != 36 {
+			continue
+		}
+		var exists int
+		err := s.db.QueryRowContext(r.Context(), `SELECT 1 FROM monitor_sessions WHERE id=? AND user_id=? AND status=1`, sessionID, userID).Scan(&exists)
+		if err != nil {
+			continue
+		}
+		if s.hub.KickDevice(sessionID) {
+			kicked++
+		}
+	}
+	s.hub.NotifyClients(userID)
+	writeJSON(w, http.StatusOK, map[string]int{"kickedCount": kicked})
 }
 
 func requestedUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {

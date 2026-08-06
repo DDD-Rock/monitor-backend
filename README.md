@@ -83,9 +83,9 @@ ALLOW_REGISTRATION=true
 - `PATCH /api/admin/users/{id}/client-limit`（超级管理员设置客户端数量上限）
 - `GET /api/admin/invite-codes`（超级管理员查看最近生成的邀请码）
 - `POST /api/admin/invite-codes`（超级管理员生成一次性限时邀请码）
-- `GET /api/admin/maps`（超级管理员浏览云端地图库元数据）
+- `GET /api/admin/maps`（登录用户浏览云端地图库元数据）
 - `POST /api/admin/maps`（超级管理员上传/更新地图标注）
-- `GET /api/admin/maps/{id}`（超级管理员按需下载单张地图）
+- `GET /api/admin/maps/{id}`（登录用户按需下载单张地图）
 - `DELETE /api/admin/maps/{id}`（超级管理员删除云端地图）
 - `GET /api/healthz`
 - `GET /ws/device?client_id=...`（客户端设备与控制通道）

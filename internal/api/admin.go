@@ -245,8 +245,16 @@ func (s *Server) handleAdminUserAuthorizedModes(w http.ResponseWriter, r *http.R
 		return
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
-		writeError(w, http.StatusNotFound, "user_not_found", "用户不存在")
-		return
+		var exists int
+		err = s.db.QueryRowContext(r.Context(), `SELECT 1 FROM users WHERE id = ?`, userID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "user_not_found", "用户不存在")
+			return
+		}
+		if err != nil {
+			s.internalError(w, "check user after mode permission update failed", err)
+			return
+		}
 	}
 	s.hub.NotifyClients(userID)
 	w.WriteHeader(http.StatusNoContent)

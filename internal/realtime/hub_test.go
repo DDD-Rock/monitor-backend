@@ -258,6 +258,28 @@ func TestDisconnectDeviceSignalsActiveConnection(t *testing.T) {
 	}
 }
 
+func TestKickDeviceSignalsLogoutWithoutUnbind(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	defer hub.Close()
+	controls, detach := hub.AttachDevice("session-1", 42, "publisher-1")
+	defer detach()
+	if !hub.KickDevice("session-1") {
+		t.Fatal("expected active device to accept kick")
+	}
+	command := <-controls
+	var decoded protocol.ClientCommand
+	if err := json.Unmarshal(command, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Action != "kick" || decoded.Reason == "" {
+		t.Fatalf("unexpected kick command: %#v", decoded)
+	}
+	if signal := <-controls; signal != nil {
+		t.Fatal("expected disconnect signal")
+	}
+}
+
 func TestSnapshotIncludesLatestEXP(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

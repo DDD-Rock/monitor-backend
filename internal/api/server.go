@@ -633,14 +633,20 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 				_ = connection.Close(websocket.StatusPolicyViolation, err.Error())
 				return
 			}
+			if envelope.Type == protocol.TypeClientState {
+				var state protocol.ClientStatePayload
+				if json.Unmarshal(envelope.Payload, &state) == nil && !permissions.allows(state.Mode) {
+					state.Running = false
+					envelope.Payload, _ = json.Marshal(state)
+					item.body, _ = json.Marshal(envelope)
+					s.hub.SendCommand(sessionID, protocol.ClientCommand{Type: "command", Action: "stop", Reason: "mode_unauthorized"})
+				}
+			}
 			accepted := s.hub.Publish(sessionID, envelope, item.body)
 			if envelope.Type == protocol.TypeClientState {
 				var state protocol.ClientStatePayload
 				if json.Unmarshal(envelope.Payload, &state) == nil {
-					if !permissions.allows(state.Mode) {
-						state.Running = false
-						s.hub.SendCommand(sessionID, protocol.ClientCommand{Type: "command", Action: "stop", Reason: "mode_unauthorized"})
-					} else if !accepted {
+					if !accepted {
 						state.Running = false
 						s.hub.SendCommand(sessionID, protocol.ClientCommand{
 							Type:   "command",

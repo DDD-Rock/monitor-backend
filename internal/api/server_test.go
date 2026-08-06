@@ -49,6 +49,8 @@ func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 		{http.MethodDelete, "/api/rope-team", ""},
 		{http.MethodGet, "/api/admin/users/1/clients", ""},
 		{http.MethodDelete, "/api/admin/users/1/clients/00000000-0000-0000-0000-000000000000", ""},
+		{http.MethodPut, "/api/admin/users/1/authorized-modes", `{"modes":["dead"]}`},
+		{http.MethodPost, "/api/admin/users/1/clients/kick", `{"sessionIds":["00000000-0000-0000-0000-000000000000"]}`},
 		{http.MethodPatch, "/api/admin/users/1/client-limit", `{"maxClientCount":1}`},
 		{http.MethodGet, "/api/admin/invite-codes", ""},
 		{http.MethodPost, "/api/admin/invite-codes", `{"durationSeconds":1800}`},
@@ -66,6 +68,21 @@ func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 		if recorder.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s 应返回 401，实际 %d", item.method, item.path, recorder.Code)
 		}
+	}
+}
+
+func TestUserModePermissions(t *testing.T) {
+	t.Parallel()
+	regular := userModePermissions{Dead: 1, Live: 1, Temple: 1}
+	if got := strings.Join(regular.authorizedModes(), ","); got != "dead,live,temple" {
+		t.Fatalf("default modes = %q", got)
+	}
+	if regular.allows("monitor") || !regular.allows("temple") || regular.allows("unknown") {
+		t.Fatal("regular mode permission check is incorrect")
+	}
+	admin := userModePermissions{IsSuperAdmin: 1}
+	if len(admin.authorizedModes()) != 5 || !admin.allows("monitor") || !admin.allows("follow_heal") {
+		t.Fatal("super admin should have all modes")
 	}
 }
 

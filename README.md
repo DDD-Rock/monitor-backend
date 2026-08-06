@@ -29,6 +29,7 @@ mysql -u root -p < migrations/monitor_schema.sql
 
 ```bash
 mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
+mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration.sql
 ```
 
 超级管理员只能直接在数据库中授予：

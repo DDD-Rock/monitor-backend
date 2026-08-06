@@ -7,10 +7,15 @@ import (
 	"autobuff-monitor/server/internal/protocol"
 )
 
-func (s *Server) startBossBuffCycle(ctx context.Context, userID int64, sessionID string) {
+func (s *Server) startBossBuffCycle(
+	ctx context.Context,
+	userID int64,
+	sessionID string,
+	bossRoleNameOverride ...string,
+) (bool, string) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return
+		return false, "storage_error"
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -27,46 +32,89 @@ func (s *Server) startBossBuffCycle(ctx context.Context, userID int64, sessionID
 		 FOR UPDATE`,
 		userID, sessionID,
 	).Scan(&teamID, &leaderSessionID, &bossRoleName, &cycleID, &state, &createdInGame)
-	if err != nil || bossRoleName == "" || state != "idle" || createdInGame == 0 {
-		return
+	if err != nil {
+		return false, "team_not_found"
+	}
+	if state != "idle" {
+		return false, "already_active"
+	}
+	if createdInGame == 0 {
+		return false, "team_not_created"
+	}
+	if len(bossRoleNameOverride) > 0 {
+		bossRoleName = bossRoleNameOverride[0]
+	}
+	if bossRoleName == "" {
+		return false, "boss_name_missing"
 	}
 	members, err := ropeTeamMemberSessionIDs(ctx, tx, teamID)
-	if err != nil || len(members) == 0 || !s.allClientsOnline(members) {
-		return
+	if err != nil || len(members) == 0 {
+		return false, "team_members_missing"
 	}
-	var joinedMembers int
-	if err = tx.QueryRowContext(
-		ctx,
-		`SELECT COUNT(*) FROM rope_team_members WHERE team_id = ? AND joined = 1`,
-		teamID,
-	).Scan(&joinedMembers); err != nil || joinedMembers != len(members) {
-		return
+	onlineMembers := s.onlineClientSessionIDs(members)
+	if !containsSessionID(onlineMembers, leaderSessionID) {
+		return false, "leader_offline"
+	}
+	// created_in_game is set by the leader's team_created receipt, so the leader
+	// can participate immediately even if the member joined flag arrives a little
+	// later. Other members still need an explicit joined receipt.
+	participants := []string{leaderSessionID}
+	for _, memberSessionID := range onlineMembers {
+		if memberSessionID == leaderSessionID {
+			continue
+		}
+		var joined uint8
+		if err = tx.QueryRowContext(
+			ctx,
+			`SELECT joined FROM rope_team_members WHERE team_id = ? AND session_id = ?`,
+			teamID, memberSessionID,
+		).Scan(&joined); err != nil {
+			return false, "storage_error"
+		}
+		if joined == 1 {
+			participants = append(participants, memberSessionID)
+		}
 	}
 	cycleID++
 	if _, err = tx.ExecContext(
 		ctx,
-		`UPDATE rope_teams SET boss_cycle_id = ?, boss_cycle_state = 'inviting' WHERE id = ?`,
-		cycleID, teamID,
+		`UPDATE rope_teams
+		 SET boss_role_name = ?, boss_cycle_id = ?, boss_cycle_state = 'inviting'
+		 WHERE id = ?`,
+		bossRoleName, cycleID, teamID,
 	); err != nil {
-		return
+		return false, "storage_error"
 	}
+	// Members that are offline when the cycle starts are skipped for this cycle,
+	// so their missing completion receipt cannot block the leader from kicking.
 	if _, err = tx.ExecContext(
 		ctx,
-		`UPDATE rope_team_members SET boss_completed_cycle_id = 0 WHERE team_id = ?`,
-		teamID,
+		`UPDATE rope_team_members SET boss_completed_cycle_id = ? WHERE team_id = ?`,
+		cycleID, teamID,
 	); err != nil {
-		return
+		return false, "storage_error"
+	}
+	for _, memberSessionID := range participants {
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE rope_team_members SET boss_completed_cycle_id = 0
+			 WHERE team_id = ? AND session_id = ?`,
+			teamID, memberSessionID,
+		); err != nil {
+			return false, "storage_error"
+		}
 	}
 	if err = tx.Commit(); err != nil {
-		return
+		return false, "storage_error"
 	}
-	if !s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+	commandSent := s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
 		Type:           "command",
 		Action:         "start_boss_invite_cycle",
 		TeamID:         teamID,
 		CycleID:        cycleID,
 		TargetRoleName: bossRoleName,
-	}) {
+	})
+	if !commandSent {
 		_, _ = s.db.ExecContext(
 			ctx,
 			`UPDATE rope_teams SET boss_cycle_state = 'idle'
@@ -75,6 +123,10 @@ func (s *Server) startBossBuffCycle(ctx context.Context, userID int64, sessionID
 		)
 	}
 	s.hub.NotifyClients(userID)
+	if !commandSent {
+		return false, "leader_unavailable"
+	}
+	return true, "started"
 }
 
 func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID string, progress protocol.RopePartyProgressPayload) {
@@ -94,9 +146,23 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 	if err != nil || leaderSessionID != sessionID {
 		return
 	}
-	members, err := ropeTeamMemberSessionIDs(ctx, tx, progress.TeamID)
-	if err != nil || len(members) == 0 || !s.allClientsOnline(members) {
+	participants, err := ropeTeamPendingCycleSessionIDs(ctx, tx, progress.TeamID, progress.CycleID)
+	if err != nil || len(participants) == 0 {
 		return
+	}
+	onlineParticipants := s.onlineClientSessionIDs(participants)
+	for _, memberSessionID := range participants {
+		if containsSessionID(onlineParticipants, memberSessionID) {
+			continue
+		}
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
+			 WHERE team_id = ? AND session_id = ?`,
+			progress.CycleID, progress.TeamID, memberSessionID,
+		); err != nil {
+			return
+		}
 	}
 	if _, err = tx.ExecContext(
 		ctx,
@@ -106,13 +172,21 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 	); err != nil || tx.Commit() != nil {
 		return
 	}
-	for _, memberSessionID := range members {
-		s.hub.SendCommand(memberSessionID, protocol.ClientCommand{
+	for _, memberSessionID := range onlineParticipants {
+		if s.hub.SendCommand(memberSessionID, protocol.ClientCommand{
 			Type:    "command",
 			Action:  "cast_boss_buffs",
 			TeamID:  progress.TeamID,
 			CycleID: progress.CycleID,
-		})
+		}) {
+			continue
+		}
+		_, _ = s.db.ExecContext(
+			ctx,
+			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
+			 WHERE team_id = ? AND session_id = ?`,
+			progress.CycleID, progress.TeamID, memberSessionID,
+		)
 	}
 	s.hub.NotifyClients(userID)
 }
@@ -148,6 +222,23 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
 		return
+	}
+	members, err := ropeTeamPendingCycleSessionIDs(ctx, tx, progress.TeamID, progress.CycleID)
+	if err != nil {
+		return
+	}
+	for _, memberSessionID := range members {
+		if online, _, _ := s.hub.ClientStatus(memberSessionID); online {
+			continue
+		}
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
+			 WHERE team_id = ? AND session_id = ?`,
+			progress.CycleID, progress.TeamID, memberSessionID,
+		); err != nil {
+			return
+		}
 	}
 	var total, completed int
 	err = tx.QueryRowContext(
@@ -225,11 +316,43 @@ func ropeTeamMemberSessionIDs(ctx context.Context, tx *sql.Tx, teamID int64) ([]
 	return members, rows.Err()
 }
 
-func (s *Server) allClientsOnline(sessionIDs []string) bool {
+func ropeTeamPendingCycleSessionIDs(ctx context.Context, tx *sql.Tx, teamID, cycleID int64) ([]string, error) {
+	rows, err := tx.QueryContext(
+		ctx,
+		`SELECT session_id FROM rope_team_members
+		 WHERE team_id = ? AND boss_completed_cycle_id <> ?`,
+		teamID, cycleID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var members []string
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, err
+		}
+		members = append(members, sessionID)
+	}
+	return members, rows.Err()
+}
+
+func (s *Server) onlineClientSessionIDs(sessionIDs []string) []string {
+	onlineSessionIDs := make([]string, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
-		if online, _, _ := s.hub.ClientStatus(sessionID); !online {
-			return false
+		if online, _, _ := s.hub.ClientStatus(sessionID); online {
+			onlineSessionIDs = append(onlineSessionIDs, sessionID)
 		}
 	}
-	return true
+	return onlineSessionIDs
+}
+
+func containsSessionID(sessionIDs []string, target string) bool {
+	for _, sessionID := range sessionIDs {
+		if sessionID == target {
+			return true
+		}
+	}
+	return false
 }

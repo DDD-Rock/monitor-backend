@@ -651,7 +651,7 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 				if json.Unmarshal(envelope.Payload, &progress) == nil {
 					switch progress.Event {
 					case "buff_due":
-						s.startBossBuffCycle(r.Context(), user.ID, sessionID)
+						_, _ = s.startBossBuffCycle(r.Context(), user.ID, sessionID)
 						continue
 					case "boss_joined":
 						s.markBossJoined(r.Context(), user.ID, sessionID, progress)

@@ -174,12 +174,15 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 	}
 	userID := mustUser(r.Context()).ID
 	var cycleState string
+	var leaderSessionID string
+	var currentBossRoleName string
 	var createdInGame uint8
 	err := s.db.QueryRowContext(
 		r.Context(),
-		`SELECT boss_cycle_state, created_in_game FROM rope_teams WHERE user_id = ? LIMIT 1`,
+		`SELECT boss_cycle_state, created_in_game, leader_session_id, boss_role_name
+		 FROM rope_teams WHERE user_id = ? LIMIT 1`,
 		userID,
-	).Scan(&cycleState, &createdInGame)
+	).Scan(&cycleState, &createdInGame, &leaderSessionID, &currentBossRoleName)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "rope_team_not_found", "请先创建挂绳队伍")
 		return
@@ -189,6 +192,22 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if cycleState != "idle" {
+		if currentBossRoleName == request.RoleName {
+			team, loadErr := s.ropeTeam(r.Context(), userID)
+			if loadErr != nil {
+				s.internalError(w, "reload active rope team boss failed", loadErr)
+				return
+			}
+			leaderOnline, _, _ := s.hub.ClientStatus(leaderSessionID)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"team":          team,
+				"cycleStarted":  false,
+				"leaderOnline":  leaderOnline,
+				"alreadyActive": true,
+				"startReason":   "already_active",
+			})
+			return
+		}
 		writeError(w, http.StatusConflict, "boss_cycle_active", "老板 Buff 流程运行中，暂时不能修改目标老板")
 		return
 	}
@@ -196,16 +215,24 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusConflict, "rope_team_not_created", "请等待队长客户端完成游戏内建队")
 		return
 	}
-	_, err = s.db.ExecContext(
-		r.Context(),
-		`UPDATE rope_teams
-		 SET boss_role_name = ?, boss_cycle_state = 'idle'
-		 WHERE user_id = ?`,
-		request.RoleName, userID,
-	)
-	if err != nil {
-		s.internalError(w, "save rope team boss failed", err)
-		return
+	leaderOnline, _, _ := s.hub.ClientStatus(leaderSessionID)
+	cycleStarted := false
+	startReason := "leader_offline"
+	if leaderOnline {
+		cycleStarted, startReason = s.startBossBuffCycle(
+			r.Context(), userID, leaderSessionID, request.RoleName,
+		)
+	}
+	if !cycleStarted {
+		if _, err = s.db.ExecContext(
+			r.Context(),
+			`UPDATE rope_teams SET boss_role_name = ?
+			 WHERE user_id = ? AND boss_cycle_state = 'idle'`,
+			request.RoleName, userID,
+		); err != nil {
+			s.internalError(w, "save rope team boss failed", err)
+			return
+		}
 	}
 	s.hub.NotifyClients(userID)
 	team, loadErr := s.ropeTeam(r.Context(), userID)
@@ -213,7 +240,19 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, "reload rope team after boss save failed", loadErr)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"team": team})
+	if !cycleStarted && team != nil && team.BossCycleState != "idle" && team.BossRoleName != request.RoleName {
+		writeError(w, http.StatusConflict, "boss_cycle_active", "老板 Buff 流程已由另一项保存操作启动，请等待本轮结束")
+		return
+	}
+	alreadyActive := !cycleStarted && team != nil &&
+		team.BossCycleState != "idle" && team.BossRoleName == request.RoleName
+	writeJSON(w, http.StatusOK, map[string]any{
+		"team":          team,
+		"cycleStarted":  cycleStarted,
+		"leaderOnline":  leaderOnline,
+		"alreadyActive": alreadyActive,
+		"startReason":   startReason,
+	})
 }
 
 func validRoleName(value string) bool {

@@ -649,6 +649,8 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 			if envelope.Type == protocol.TypeRopeProgress {
 				var progress protocol.RopePartyProgressPayload
 				if json.Unmarshal(envelope.Payload, &progress) == nil {
+					var result sql.Result
+					var updateErr error
 					switch progress.Event {
 					case "buff_due":
 						_, _ = s.startBossBuffCycle(r.Context(), user.ID, sessionID)
@@ -662,9 +664,24 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 					case "boss_kicked":
 						s.markBossKicked(r.Context(), user.ID, sessionID, progress)
 						continue
+					case "boss_cycle_disbanded":
+						result, updateErr = s.db.ExecContext(
+							r.Context(),
+							`UPDATE rope_teams
+							 SET created_in_game = 0, boss_cycle_state = 'idle'
+							 WHERE id = ? AND user_id = ? AND leader_session_id = ?
+							   AND boss_cycle_id = ? AND boss_cycle_state = 'disbanding'`,
+							progress.TeamID, user.ID, sessionID, progress.CycleID,
+						)
+						if updateErr == nil {
+							_, updateErr = s.db.ExecContext(
+								r.Context(),
+								`UPDATE rope_team_members SET invited = 0, joined = 0,
+								        joined_at = NULL, boss_completed_cycle_id = 0
+							 WHERE team_id = ?`, progress.TeamID,
+							)
+						}
 					}
-					var result sql.Result
-					var updateErr error
 					switch progress.Event {
 					case "team_created":
 						result, updateErr = s.db.ExecContext(

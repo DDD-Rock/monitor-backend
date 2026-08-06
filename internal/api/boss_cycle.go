@@ -135,14 +135,14 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	var leaderSessionID string
+	var leaderSessionID, state string
 	err = tx.QueryRowContext(
 		ctx,
-		`SELECT leader_session_id FROM rope_teams
+		`SELECT leader_session_id, boss_cycle_state FROM rope_teams
 		 WHERE id = ? AND user_id = ? AND boss_cycle_id = ?
-		   AND boss_cycle_state = 'inviting' FOR UPDATE`,
+		   AND boss_cycle_state IN ('inviting', 'casting') FOR UPDATE`,
 		progress.TeamID, userID, progress.CycleID,
-	).Scan(&leaderSessionID)
+	).Scan(&leaderSessionID, &state)
 	if err != nil || leaderSessionID != sessionID {
 		return
 	}
@@ -164,12 +164,17 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 			return
 		}
 	}
-	if _, err = tx.ExecContext(
-		ctx,
-		`UPDATE rope_teams SET boss_cycle_state = 'casting'
-		 WHERE id = ? AND boss_cycle_id = ?`,
-		progress.TeamID, progress.CycleID,
-	); err != nil || tx.Commit() != nil {
+	if state == "inviting" {
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE rope_teams SET boss_cycle_state = 'casting'
+			 WHERE id = ? AND boss_cycle_id = ? AND boss_cycle_state = 'inviting'`,
+			progress.TeamID, progress.CycleID,
+		); err != nil {
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
 		return
 	}
 	for _, memberSessionID := range onlineParticipants {
@@ -181,12 +186,9 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 		}) {
 			continue
 		}
-		_, _ = s.db.ExecContext(
-			ctx,
-			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
-			 WHERE team_id = ? AND session_id = ?`,
-			progress.CycleID, progress.TeamID, memberSessionID,
-		)
+		// Keep the member pending when a live command cannot be queued. A
+		// repeated boss_joined receipt will retry the command instead of
+		// incorrectly allowing the cycle to kick the boss early.
 	}
 	s.hub.NotifyClients(userID)
 }
@@ -197,14 +199,14 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	var leaderSessionID, bossRoleName string
+	var leaderSessionID string
 	err = tx.QueryRowContext(
 		ctx,
-		`SELECT leader_session_id, boss_role_name FROM rope_teams
+		`SELECT leader_session_id FROM rope_teams
 		 WHERE id = ? AND user_id = ? AND boss_cycle_id = ?
 		   AND boss_cycle_state = 'casting' FOR UPDATE`,
 		progress.TeamID, userID, progress.CycleID,
-	).Scan(&leaderSessionID, &bossRoleName)
+	).Scan(&leaderSessionID)
 	if err != nil {
 		return
 	}
@@ -257,7 +259,7 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 	if allCompleted {
 		result, err = tx.ExecContext(
 			ctx,
-			`UPDATE rope_teams SET boss_cycle_state = 'kicking'
+			`UPDATE rope_teams SET boss_cycle_state = 'disbanding'
 			 WHERE id = ? AND boss_cycle_id = ? AND boss_cycle_state = 'casting'`,
 			progress.TeamID, progress.CycleID,
 		)
@@ -273,11 +275,10 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 	}
 	if allCompleted {
 		s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
-			Type:           "command",
-			Action:         "kick_boss_from_party",
-			TeamID:         progress.TeamID,
-			CycleID:        progress.CycleID,
-			TargetRoleName: bossRoleName,
+			Type:    "command",
+			Action:  "disband_boss_party",
+			TeamID:  progress.TeamID,
+			CycleID: progress.CycleID,
 		})
 	}
 	s.hub.NotifyClients(userID)

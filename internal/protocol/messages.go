@@ -306,6 +306,10 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 			if payload.RoleName != "" {
 				return Envelope{}, errors.New("team disbanded progress must not carry role name")
 			}
+		case "boss_cycle_disbanded":
+			if payload.CycleID <= 0 || payload.RoleName != "" {
+				return Envelope{}, errors.New("invalid boss cycle disbanded progress")
+			}
 		case "buff_due":
 			if payload.CycleID != 0 || payload.RoleName != "" {
 				return Envelope{}, errors.New("buff due progress must not carry cycle or role name")

@@ -168,6 +168,7 @@ func TestValidateEnvelopeAcceptsRopePartyProgress(t *testing.T) {
 		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"cycleId":3,"event":"boss_joined"}}`,
 		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"cycleId":3,"event":"buff_completed"}}`,
 		`{"type":"rope_party_progress","sequence":9,"payload":{"teamId":7,"cycleId":3,"event":"boss_kicked"}}`,
+		`{"type":"rope_party_progress","sequence":10,"payload":{"teamId":7,"cycleId":3,"event":"boss_cycle_disbanded"}}`,
 	} {
 		if _, err := ValidateEnvelope([]byte(message)); err != nil {
 			t.Fatalf("expected valid rope party progress, got %v", err)

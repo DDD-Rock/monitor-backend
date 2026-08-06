@@ -373,6 +373,8 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 
 	var teamID int64
 	firstCreation := false
+	previousLeaderSessionID := ""
+	leaderChanging := false
 	err = tx.QueryRowContext(
 		r.Context(),
 		`SELECT id FROM rope_teams WHERE user_id = ? FOR UPDATE`,
@@ -391,12 +393,21 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 		teamID, err = result.LastInsertId()
 		firstCreation = true
 	} else if err == nil {
+		_ = tx.QueryRowContext(r.Context(), `SELECT leader_session_id FROM rope_teams WHERE id = ? FOR UPDATE`, teamID).Scan(&previousLeaderSessionID)
+		leaderChanging = previousLeaderSessionID != "" && previousLeaderSessionID != request.LeaderSessionID
+		if leaderChanging {
+			if online, _, _ := s.hub.ClientStatus(previousLeaderSessionID); !online {
+				writeError(w, http.StatusConflict, "previous_leader_offline", "更换队长前，旧队长客户端必须在线并退出原队伍")
+				return
+			}
+		}
 		_, err = tx.ExecContext(
 			r.Context(),
 			`UPDATE rope_teams
-			 SET leader_session_id = ?, created_in_game = 0, boss_cycle_state = 'idle'
+			 SET leader_session_id = ?, created_in_game = 0,
+			     boss_cycle_state = ?
 			 WHERE id = ?`,
-			request.LeaderSessionID, teamID,
+			request.LeaderSessionID, map[bool]string{true: "changing_leader", false: "idle"}[leaderChanging], teamID,
 		)
 	} else {
 		s.internalError(w, "load rope team for update failed", err)
@@ -428,6 +439,17 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inviteRoleNames := make([]string, 0, len(request.MemberSessionIDs)-1)
+	if leaderChanging {
+		s.hub.SendCommand(previousLeaderSessionID, protocol.ClientCommand{Type: "command", Action: "disband_rope_party", TeamID: teamID})
+		s.hub.NotifyClients(userID)
+		team, loadErr := s.ropeTeam(r.Context(), userID)
+		if loadErr != nil {
+			s.internalError(w, "reload rope team failed", loadErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"team": team, "firstCreation": false, "leaderChanging": true})
+		return
+	}
 	for _, sessionID := range request.MemberSessionIDs {
 		if sessionID != request.LeaderSessionID {
 			inviteRoleNames = append(inviteRoleNames, roleNames[sessionID])
@@ -459,6 +481,37 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 		"team":          team,
 		"firstCreation": firstCreation,
 	})
+}
+
+func (s *Server) configureSavedRopeTeam(ctx context.Context, userID, teamID int64) {
+	rows, err := s.db.QueryContext(ctx, `SELECT rtm.session_id, ms.role_name, (rt.leader_session_id = rtm.session_id) FROM rope_team_members rtm JOIN rope_teams rt ON rt.id = rtm.team_id JOIN monitor_sessions ms ON ms.id = rtm.session_id WHERE rt.id = ? ORDER BY (rt.leader_session_id = rtm.session_id) DESC, ms.created_at`, teamID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	type member struct {
+		id, role string
+		leader   bool
+	}
+	var members []member
+	for rows.Next() {
+		var item member
+		var leader uint8
+		if rows.Scan(&item.id, &item.role, &leader) == nil {
+			item.leader = leader == 1
+			members = append(members, item)
+		}
+	}
+	var invites []string
+	for _, item := range members {
+		if !item.leader {
+			invites = append(invites, item.role)
+		}
+	}
+	for _, item := range members {
+		s.hub.SendCommand(item.id, protocol.ClientCommand{Type: "command", Action: "configure_rope_party", TeamID: teamID, IsLeader: item.leader, FirstCreation: true, RoleName: item.role, InviteRoleNames: invites})
+	}
+	s.hub.NotifyClients(userID)
 }
 
 func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {

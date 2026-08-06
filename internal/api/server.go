@@ -707,12 +707,16 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 							progress.TeamID, user.ID, sessionID, progress.RoleName,
 						)
 					case "team_disbanded":
-						result, updateErr = s.db.ExecContext(
-							r.Context(),
-							`DELETE FROM rope_teams
-							 WHERE id = ? AND user_id = ? AND leader_session_id = ?`,
-							progress.TeamID, user.ID, sessionID,
-						)
+						var state string
+						_ = s.db.QueryRowContext(r.Context(), `SELECT boss_cycle_state FROM rope_teams WHERE id = ? AND user_id = ?`, progress.TeamID, user.ID).Scan(&state)
+						if state == "changing_leader" {
+							result, updateErr = s.db.ExecContext(r.Context(), `UPDATE rope_teams SET created_in_game = 0, boss_cycle_state = 'idle' WHERE id = ? AND user_id = ? AND leader_session_id <> ?`, progress.TeamID, user.ID, sessionID)
+							if updateErr == nil {
+								s.configureSavedRopeTeam(r.Context(), user.ID, progress.TeamID)
+							}
+						} else {
+							result, updateErr = s.db.ExecContext(r.Context(), `DELETE FROM rope_teams WHERE id = ? AND user_id = ? AND leader_session_id = ?`, progress.TeamID, user.ID, sessionID)
+						}
 					}
 					if updateErr == nil && result != nil {
 						if affected, _ := result.RowsAffected(); affected > 0 {

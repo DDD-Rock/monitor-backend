@@ -92,6 +92,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PUT /api/clients/role-name", s.requireAuth(http.HandlerFunc(s.handleSaveClientRoleName)))
 	mux.Handle("GET /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleRopeTeam)))
 	mux.Handle("PUT /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeam)))
+	mux.Handle("PUT /api/rope-team/boss", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeamBoss)))
 	mux.Handle("DELETE /api/rope-team/members/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleRemoveRopeTeamMember)))
 	mux.Handle("DELETE /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleDeleteRopeTeam)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
@@ -634,11 +635,69 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						r.Context(),
 						`UPDATE rope_team_members rtm
 						 JOIN rope_teams rt ON rt.id = rtm.team_id
-						 SET rtm.joined = 1, rtm.joined_at = NOW(3)
+						 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
 						 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
 						joined.TeamID, sessionID, user.ID,
 					)
 					if updateErr == nil {
+						if affected, _ := result.RowsAffected(); affected > 0 {
+							s.hub.NotifyClients(user.ID)
+						}
+					}
+				}
+			}
+			if envelope.Type == protocol.TypeRopeProgress {
+				var progress protocol.RopePartyProgressPayload
+				if json.Unmarshal(envelope.Payload, &progress) == nil {
+					switch progress.Event {
+					case "buff_due":
+						s.startBossBuffCycle(r.Context(), user.ID, sessionID)
+						continue
+					case "boss_joined":
+						s.markBossJoined(r.Context(), user.ID, sessionID, progress)
+						continue
+					case "buff_completed":
+						s.markBossBuffCompleted(r.Context(), user.ID, sessionID, progress)
+						continue
+					case "boss_kicked":
+						s.markBossKicked(r.Context(), user.ID, sessionID, progress)
+						continue
+					}
+					var result sql.Result
+					var updateErr error
+					switch progress.Event {
+					case "team_created":
+						result, updateErr = s.db.ExecContext(
+							r.Context(),
+							`UPDATE rope_teams rt
+							 JOIN rope_team_members rtm
+							   ON rtm.team_id = rt.id AND rtm.session_id = rt.leader_session_id
+							 SET rt.created_in_game = 1,
+							     rtm.joined = 1,
+							     rtm.joined_at = NOW(3)
+							 WHERE rt.id = ? AND rt.user_id = ? AND rt.leader_session_id = ?`,
+							progress.TeamID, user.ID, sessionID,
+						)
+					case "invitation_sent":
+						result, updateErr = s.db.ExecContext(
+							r.Context(),
+							`UPDATE rope_team_members rtm
+							 JOIN rope_teams rt ON rt.id = rtm.team_id
+							 JOIN monitor_sessions ms ON ms.id = rtm.session_id
+							 SET rtm.invited = 1
+							 WHERE rtm.team_id = ? AND rt.user_id = ?
+							   AND rt.leader_session_id = ? AND ms.role_name = ?`,
+							progress.TeamID, user.ID, sessionID, progress.RoleName,
+						)
+					case "team_disbanded":
+						result, updateErr = s.db.ExecContext(
+							r.Context(),
+							`DELETE FROM rope_teams
+							 WHERE id = ? AND user_id = ? AND leader_session_id = ?`,
+							progress.TeamID, user.ID, sessionID,
+						)
+					}
+					if updateErr == nil && result != nil {
 						if affected, _ := result.RowsAffected(); affected > 0 {
 							s.hub.NotifyClients(user.ID)
 						}

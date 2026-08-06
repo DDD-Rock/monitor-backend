@@ -67,18 +67,24 @@ func (s *Server) clientItems(ctx context.Context, userID int64) ([]clientItem, e
 }
 
 type ropeTeamMemberItem struct {
-	SessionID string `json:"sessionId"`
-	ClientID  string `json:"clientId"`
-	Name      string `json:"name"`
-	RoleName  string `json:"roleName"`
-	IsLeader  bool   `json:"isLeader"`
-	Joined    bool   `json:"joined"`
-	Online    bool   `json:"online"`
+	SessionID         string `json:"sessionId"`
+	ClientID          string `json:"clientId"`
+	Name              string `json:"name"`
+	RoleName          string `json:"roleName"`
+	IsLeader          bool   `json:"isLeader"`
+	Joined            bool   `json:"joined"`
+	Invited           bool   `json:"invited"`
+	BossBuffCompleted bool   `json:"bossBuffCompleted"`
+	Online            bool   `json:"online"`
 }
 
 type ropeTeamItem struct {
 	ID              int64                `json:"id"`
 	LeaderSessionID string               `json:"leaderSessionId"`
+	CreatedInGame   bool                 `json:"createdInGame"`
+	BossRoleName    string               `json:"bossRoleName"`
+	BossCycleID     int64                `json:"bossCycleId"`
+	BossCycleState  string               `json:"bossCycleState"`
 	Members         []ropeTeamMemberItem `json:"members"`
 }
 
@@ -86,9 +92,17 @@ func (s *Server) ropeTeam(ctx context.Context, userID int64) (*ropeTeamItem, err
 	var team ropeTeamItem
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT id, leader_session_id FROM rope_teams WHERE user_id = ? LIMIT 1`,
+		`SELECT id, leader_session_id, created_in_game, boss_role_name, boss_cycle_id, boss_cycle_state
+		 FROM rope_teams WHERE user_id = ? LIMIT 1`,
 		userID,
-	).Scan(&team.ID, &team.LeaderSessionID)
+	).Scan(
+		&team.ID,
+		&team.LeaderSessionID,
+		&team.CreatedInGame,
+		&team.BossRoleName,
+		&team.BossCycleID,
+		&team.BossCycleState,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -98,7 +112,8 @@ func (s *Server) ropeTeam(ctx context.Context, userID int64) (*ropeTeamItem, err
 
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT ms.id, ms.client_id, ms.name, ms.role_name, rtm.joined
+		`SELECT ms.id, ms.client_id, ms.name, ms.role_name, rtm.joined, rtm.invited,
+		        rtm.boss_completed_cycle_id
 		 FROM rope_team_members rtm
 		 JOIN monitor_sessions ms ON ms.id = rtm.session_id
 		 WHERE rtm.team_id = ? AND ms.status = 1
@@ -113,11 +128,23 @@ func (s *Server) ropeTeam(ctx context.Context, userID int64) (*ropeTeamItem, err
 	for rows.Next() {
 		var member ropeTeamMemberItem
 		var joined uint8
-		if err := rows.Scan(&member.SessionID, &member.ClientID, &member.Name, &member.RoleName, &joined); err != nil {
+		var invited uint8
+		var completedCycleID int64
+		if err := rows.Scan(
+			&member.SessionID,
+			&member.ClientID,
+			&member.Name,
+			&member.RoleName,
+			&joined,
+			&invited,
+			&completedCycleID,
+		); err != nil {
 			return nil, err
 		}
 		member.IsLeader = member.SessionID == team.LeaderSessionID
 		member.Joined = joined == 1
+		member.Invited = invited == 1
+		member.BossBuffCompleted = team.BossCycleID > 0 && completedCycleID == team.BossCycleID
 		member.Online, _, _ = s.hub.ClientStatus(member.SessionID)
 		team.Members = append(team.Members, member)
 	}
@@ -128,6 +155,62 @@ func (s *Server) handleRopeTeam(w http.ResponseWriter, r *http.Request) {
 	team, err := s.ropeTeam(r.Context(), mustUser(r.Context()).ID)
 	if err != nil {
 		s.internalError(w, "load rope team failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"team": team})
+}
+
+func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		RoleName string `json:"roleName"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	request.RoleName = strings.TrimSpace(request.RoleName)
+	if !validRoleName(request.RoleName) {
+		writeError(w, http.StatusBadRequest, "invalid_boss_role_name", "目标老板名称须为 1–24 个字符且不能包含控制字符")
+		return
+	}
+	userID := mustUser(r.Context()).ID
+	var cycleState string
+	var createdInGame uint8
+	err := s.db.QueryRowContext(
+		r.Context(),
+		`SELECT boss_cycle_state, created_in_game FROM rope_teams WHERE user_id = ? LIMIT 1`,
+		userID,
+	).Scan(&cycleState, &createdInGame)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "rope_team_not_found", "请先创建挂绳队伍")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "load rope team boss state failed", err)
+		return
+	}
+	if cycleState != "idle" {
+		writeError(w, http.StatusConflict, "boss_cycle_active", "老板 Buff 流程运行中，暂时不能修改目标老板")
+		return
+	}
+	if createdInGame == 0 {
+		writeError(w, http.StatusConflict, "rope_team_not_created", "请等待队长客户端完成游戏内建队")
+		return
+	}
+	_, err = s.db.ExecContext(
+		r.Context(),
+		`UPDATE rope_teams
+		 SET boss_role_name = ?, boss_cycle_state = 'idle'
+		 WHERE user_id = ?`,
+		request.RoleName, userID,
+	)
+	if err != nil {
+		s.internalError(w, "save rope team boss failed", err)
+		return
+	}
+	s.hub.NotifyClients(userID)
+	team, loadErr := s.ropeTeam(r.Context(), userID)
+	if loadErr != nil {
+		s.internalError(w, "reload rope team after boss save failed", loadErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"team": team})
@@ -271,7 +354,9 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 	} else if err == nil {
 		_, err = tx.ExecContext(
 			r.Context(),
-			`UPDATE rope_teams SET leader_session_id = ? WHERE id = ?`,
+			`UPDATE rope_teams
+			 SET leader_session_id = ?, created_in_game = 0, boss_cycle_state = 'idle'
+			 WHERE id = ?`,
 			request.LeaderSessionID, teamID,
 		)
 	} else {
@@ -287,11 +372,11 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, sessionID := range request.MemberSessionIDs {
-		joined := sessionID == request.LeaderSessionID
+		joined := false
 		if _, err = tx.ExecContext(
 			r.Context(),
-			`INSERT INTO rope_team_members (team_id, session_id, joined, joined_at)
-			 VALUES (?, ?, ?, IF(?, NOW(3), NULL))`,
+			`INSERT INTO rope_team_members (team_id, session_id, invited, joined, joined_at)
+			 VALUES (?, ?, 0, ?, IF(?, NOW(3), NULL))`,
 			teamID, sessionID, joined, joined,
 		); err != nil {
 			s.internalError(w, "insert rope team member failed", err)
@@ -304,20 +389,20 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inviteRoleNames := make([]string, 0, len(request.MemberSessionIDs)-1)
-	if firstCreation {
-		for _, sessionID := range request.MemberSessionIDs {
-			if sessionID != request.LeaderSessionID {
-				inviteRoleNames = append(inviteRoleNames, roleNames[sessionID])
-			}
+	for _, sessionID := range request.MemberSessionIDs {
+		if sessionID != request.LeaderSessionID {
+			inviteRoleNames = append(inviteRoleNames, roleNames[sessionID])
 		}
 	}
 	for _, sessionID := range request.MemberSessionIDs {
 		command := protocol.ClientCommand{
-			Type:          "command",
-			Action:        "configure_rope_party",
-			TeamID:        teamID,
-			IsLeader:      sessionID == request.LeaderSessionID,
-			FirstCreation: firstCreation,
+			Type:     "command",
+			Action:   "configure_rope_party",
+			TeamID:   teamID,
+			IsLeader: sessionID == request.LeaderSessionID,
+			// “保存并执行”始终按当前网页配置重建游戏内队伍，
+			// 这样创建、邀请和入队状态都能由本轮客户端回执准确推进。
+			FirstCreation: true,
 			RoleName:      roleNames[sessionID],
 		}
 		if command.IsLeader {
@@ -366,22 +451,10 @@ func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "team_leader_unavailable", "队长客户端暂时无法接收解散指令，请稍后重试")
 		return
 	}
-	result, err := s.db.ExecContext(
-		r.Context(),
-		`DELETE FROM rope_teams WHERE id = ? AND user_id = ?`,
-		teamID, userID,
-	)
-	if err != nil {
-		s.internalError(w, "delete rope team failed", err)
-		return
-	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		writeError(w, http.StatusNotFound, "rope_team_not_found", "当前账号还没有挂绳队伍")
-		return
-	}
-	s.hub.NotifyClients(userID)
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"teamId": teamID,
+		"status": "waiting_for_client",
+	})
 }
 
 func (s *Server) handleRemoveRopeTeamMember(w http.ResponseWriter, r *http.Request) {

@@ -16,6 +16,7 @@ const (
 	TypeZone         = "zone"
 	TypeClientState  = "client_state"
 	TypeTeamJoined   = "team_joined"
+	TypeRopeProgress = "rope_party_progress"
 	// TypeGain 由服务端根据 EXP 增量汇总后推给查看端，设备端不会上报这类消息。
 	TypeGain     = "gain"
 	TypeSnapshot = "snapshot"
@@ -83,12 +84,20 @@ type ClientCommand struct {
 	FirstCreation   bool     `json:"firstCreation,omitempty"`
 	RoleName        string   `json:"roleName,omitempty"`
 	TargetRoleName  string   `json:"targetRoleName,omitempty"`
+	CycleID         int64    `json:"cycleId,omitempty"`
 	InviteRoleNames []string `json:"inviteRoleNames,omitempty"`
 }
 
 type TeamJoinedPayload struct {
 	TeamID   int64  `json:"teamId"`
 	RoleName string `json:"roleName"`
+}
+
+type RopePartyProgressPayload struct {
+	TeamID   int64  `json:"teamId"`
+	CycleID  int64  `json:"cycleId,omitempty"`
+	Event    string `json:"event"`
+	RoleName string `json:"roleName,omitempty"`
 }
 
 type EXPPayload struct {
@@ -282,6 +291,35 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil ||
 			payload.TeamID <= 0 || len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 {
 			return Envelope{}, errors.New("invalid team joined payload")
+		}
+	case TypeRopeProgress:
+		var payload RopePartyProgressPayload
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.TeamID <= 0 {
+			return Envelope{}, errors.New("invalid rope party progress payload")
+		}
+		switch payload.Event {
+		case "team_created":
+			if payload.RoleName != "" {
+				return Envelope{}, errors.New("team created progress must not carry role name")
+			}
+		case "team_disbanded":
+			if payload.RoleName != "" {
+				return Envelope{}, errors.New("team disbanded progress must not carry role name")
+			}
+		case "buff_due":
+			if payload.CycleID != 0 || payload.RoleName != "" {
+				return Envelope{}, errors.New("buff due progress must not carry cycle or role name")
+			}
+		case "boss_joined", "buff_completed", "boss_kicked":
+			if payload.CycleID <= 0 || payload.RoleName != "" {
+				return Envelope{}, errors.New("invalid boss buff cycle progress")
+			}
+		case "invitation_sent":
+			if len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 {
+				return Envelope{}, errors.New("invalid invited role name")
+			}
+		default:
+			return Envelope{}, errors.New("invalid rope party progress event")
 		}
 	default:
 		return Envelope{}, errors.New("unsupported message type")

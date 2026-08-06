@@ -668,6 +668,7 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						`UPDATE monitor_sessions SET mode = ?, running = ?, last_publish_at = NOW(3) WHERE id = ?`,
 						state.Mode, state.Running, sessionID,
 					)
+					s.resumePendingBossBuffCycle(r.Context(), user.ID, sessionID)
 				}
 			}
 			if envelope.Type == protocol.TypeTeamJoined {
@@ -677,13 +678,30 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						r.Context(),
 						`UPDATE rope_team_members rtm
 						 JOIN rope_teams rt ON rt.id = rtm.team_id
+						 JOIN monitor_sessions ms ON ms.id = rtm.session_id
 						 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
-						 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
-						joined.TeamID, sessionID, user.ID,
+						 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?
+						   AND ms.role_name = ?`,
+						joined.TeamID, sessionID, user.ID, joined.RoleName,
 					)
 					if updateErr == nil {
 						if affected, _ := result.RowsAffected(); affected > 0 {
 							s.hub.NotifyClients(user.ID)
+						}
+						var confirmed int
+						_ = s.db.QueryRowContext(
+							r.Context(),
+							`SELECT COUNT(*) FROM rope_team_members rtm
+							 JOIN rope_teams rt ON rt.id = rtm.team_id
+							 WHERE rtm.team_id = ? AND rtm.session_id = ?
+							   AND rt.user_id = ? AND rtm.joined = 1
+							   AND EXISTS (SELECT 1 FROM monitor_sessions ms WHERE ms.id = rtm.session_id AND ms.role_name = ?)`,
+							joined.TeamID, sessionID, user.ID, joined.RoleName,
+						).Scan(&confirmed)
+						if confirmed > 0 {
+							s.hub.SendCommand(sessionID, protocol.ClientCommand{
+								Type: "command", Action: "team_joined_ack", TeamID: joined.TeamID,
+							})
 						}
 					}
 				}

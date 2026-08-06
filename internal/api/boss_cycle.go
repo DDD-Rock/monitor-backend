@@ -55,26 +55,10 @@ func (s *Server) startBossBuffCycle(
 	if !containsSessionID(onlineMembers, leaderSessionID) {
 		return false, "leader_offline"
 	}
-	// created_in_game is set by the leader's team_created receipt, so the leader
-	// can participate immediately even if the member joined flag arrives a little
-	// later. Other members still need an explicit joined receipt.
-	participants := []string{leaderSessionID}
-	for _, memberSessionID := range onlineMembers {
-		if memberSessionID == leaderSessionID {
-			continue
-		}
-		var joined uint8
-		if err = tx.QueryRowContext(
-			ctx,
-			`SELECT joined FROM rope_team_members WHERE team_id = ? AND session_id = ?`,
-			teamID, memberSessionID,
-		).Scan(&joined); err != nil {
-			return false, "storage_error"
-		}
-		if joined == 1 {
-			participants = append(participants, memberSessionID)
-		}
-	}
+	// Freeze every online configured member into this cycle. joined is a UI
+	// receipt and may arrive slightly late or be retried after reconnect; it must
+	// not decide whether an online Buff client is allowed to skip the cycle.
+	participants := onlineMembers
 	cycleID++
 	if _, err = tx.ExecContext(
 		ctx,
@@ -151,19 +135,6 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 		return
 	}
 	onlineParticipants := s.onlineClientSessionIDs(participants)
-	for _, memberSessionID := range participants {
-		if containsSessionID(onlineParticipants, memberSessionID) {
-			continue
-		}
-		if _, err = tx.ExecContext(
-			ctx,
-			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
-			 WHERE team_id = ? AND session_id = ?`,
-			progress.CycleID, progress.TeamID, memberSessionID,
-		); err != nil {
-			return
-		}
-	}
 	if state == "inviting" {
 		if _, err = tx.ExecContext(
 			ctx,
@@ -225,23 +196,6 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 	if affected, _ := result.RowsAffected(); affected == 0 {
 		return
 	}
-	members, err := ropeTeamPendingCycleSessionIDs(ctx, tx, progress.TeamID, progress.CycleID)
-	if err != nil {
-		return
-	}
-	for _, memberSessionID := range members {
-		if online, _, _ := s.hub.ClientStatus(memberSessionID); online {
-			continue
-		}
-		if _, err = tx.ExecContext(
-			ctx,
-			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
-			 WHERE team_id = ? AND session_id = ?`,
-			progress.CycleID, progress.TeamID, memberSessionID,
-		); err != nil {
-			return
-		}
-	}
 	var total, completed int
 	err = tx.QueryRowContext(
 		ctx,
@@ -282,6 +236,26 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 		})
 	}
 	s.hub.NotifyClients(userID)
+}
+
+func (s *Server) resumePendingBossBuffCycle(ctx context.Context, userID int64, sessionID string) {
+	var teamID, cycleID int64
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT rt.id, rt.boss_cycle_id
+		 FROM rope_teams rt
+		 JOIN rope_team_members rtm ON rtm.team_id = rt.id
+		 WHERE rt.user_id = ? AND rtm.session_id = ?
+		   AND rt.boss_cycle_state = 'casting'
+		   AND rtm.boss_completed_cycle_id <> rt.boss_cycle_id`,
+		userID, sessionID,
+	).Scan(&teamID, &cycleID)
+	if err != nil {
+		return
+	}
+	s.hub.SendCommand(sessionID, protocol.ClientCommand{
+		Type: "command", Action: "cast_boss_buffs", TeamID: teamID, CycleID: cycleID,
+	})
 }
 
 func (s *Server) markBossKicked(ctx context.Context, userID int64, sessionID string, progress protocol.RopePartyProgressPayload) {

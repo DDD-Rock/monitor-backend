@@ -439,21 +439,32 @@ func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, "load rope team for delete failed", err)
 		return
 	}
-	if online, _, _ := s.hub.ClientStatus(leaderSessionID); !online {
-		writeError(w, http.StatusConflict, "team_leader_offline", "队长客户端必须在线才能解散队伍")
+	result, err := s.db.ExecContext(
+		r.Context(),
+		`DELETE FROM rope_teams WHERE id = ? AND user_id = ?`,
+		teamID, userID,
+	)
+	if err != nil {
+		s.internalError(w, "delete rope team failed", err)
 		return
 	}
-	if !s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		writeError(w, http.StatusNotFound, "rope_team_not_found", "当前账号还没有挂绳队伍")
+		return
+	}
+
+	// Exiting the in-game party is best-effort. A later team creation always
+	// starts with /退出隊伍, so an offline leader must not block deleting the
+	// web-side team configuration.
+	commandSent := s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
 		Type:   "command",
 		Action: "disband_rope_party",
 		TeamID: teamID,
-	}) {
-		writeError(w, http.StatusConflict, "team_leader_unavailable", "队长客户端暂时无法接收解散指令，请稍后重试")
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"teamId": teamID,
-		"status": "waiting_for_client",
+	})
+	s.hub.NotifyClients(userID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"teamId":      teamID,
+		"commandSent": commandSent,
 	})
 }
 

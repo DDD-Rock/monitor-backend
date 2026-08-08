@@ -10,6 +10,7 @@ import (
 
 type Room struct {
 	mu                 sync.RWMutex
+	commandMu          sync.Mutex
 	publisher          string
 	userID             int64
 	controls           chan []byte
@@ -62,15 +63,17 @@ func (h *Hub) AttachPublisher(sessionID, connectionID string) func() {
 
 func (h *Hub) AttachDevice(sessionID string, userID int64, connectionID string) (<-chan []byte, func()) {
 	room := h.room(sessionID)
+	room.commandMu.Lock()
 	room.mu.Lock()
 	room.publisher = connectionID
 	room.userID = userID
-	room.controls = make(chan []byte, 8)
+	room.controls = make(chan []byte, 64)
 	room.connected = true
 	room.online = userID == 0 || (room.clientState.Mode == "monitor" && room.clientState.Running)
 	room.updatedAt = time.Now().UnixMilli()
 	controls := room.controls
 	room.mu.Unlock()
+	room.commandMu.Unlock()
 	room.broadcastSnapshot()
 	h.notifyClientObservers(userID)
 
@@ -184,6 +187,8 @@ func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool
 	if room == nil {
 		return false
 	}
+	room.commandMu.Lock()
+	defer room.commandMu.Unlock()
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 	controls := room.controls
@@ -194,7 +199,7 @@ func (h *Hub) SendCommand(sessionID string, command protocol.ClientCommand) bool
 	select {
 	case controls <- body:
 		return true
-	default:
+	case <-time.After(2 * time.Second):
 		return false
 	}
 }

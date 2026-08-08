@@ -51,9 +51,22 @@ func (s *Server) startBossBuffCycle(
 	if err != nil || len(members) == 0 {
 		return false, "team_members_missing"
 	}
-	onlineMembers := s.onlineClientSessionIDs(members)
+	onlineMembers := s.activeTempleClientSessionIDs(members)
 	if !containsSessionID(onlineMembers, leaderSessionID) {
 		return false, "leader_offline"
+	}
+	for _, memberSessionID := range onlineMembers {
+		var joined uint8
+		if err = tx.QueryRowContext(
+			ctx,
+			`SELECT joined FROM rope_team_members WHERE team_id = ? AND session_id = ?`,
+			teamID, memberSessionID,
+		).Scan(&joined); err != nil {
+			return false, "storage_error"
+		}
+		if joined == 0 {
+			return false, "team_members_not_joined"
+		}
 	}
 	// Freeze every online configured member into this cycle. joined is a UI
 	// receipt and may arrive slightly late or be retried after reconnect; it must
@@ -134,7 +147,7 @@ func (s *Server) markBossJoined(ctx context.Context, userID int64, sessionID str
 	if err != nil || len(participants) == 0 {
 		return
 	}
-	onlineParticipants := s.onlineClientSessionIDs(participants)
+	onlineParticipants := s.activeTempleClientSessionIDs(participants)
 	if state == "inviting" {
 		if _, err = tx.ExecContext(
 			ctx,
@@ -194,6 +207,9 @@ func (s *Server) markBossBuffCompleted(ctx context.Context, userID int64, sessio
 		return
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
+		return
+	}
+	if err = s.skipInactiveBossCycleParticipants(ctx, tx, progress.TeamID, progress.CycleID); err != nil {
 		return
 	}
 	var total, completed int
@@ -258,6 +274,105 @@ func (s *Server) resumePendingBossBuffCycle(ctx context.Context, userID int64, s
 	})
 }
 
+// reconcileBossBuffCycle retries state-changing commands from the regular
+// client-state heartbeat and removes clients that stopped or disconnected from
+// the current cycle's completion barrier. Client workers deduplicate commands by
+// cycle ID, so repeating them is safe and prevents a transient queue failure
+// from leaving the web state permanently stuck.
+func (s *Server) reconcileBossBuffCycle(ctx context.Context, userID int64) {
+	var teamID, cycleID int64
+	var leaderSessionID, bossRoleName, state string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, leader_session_id, boss_role_name, boss_cycle_id, boss_cycle_state
+		 FROM rope_teams WHERE user_id = ? AND boss_cycle_state <> 'idle' LIMIT 1`,
+		userID,
+	).Scan(&teamID, &leaderSessionID, &bossRoleName, &cycleID, &state); err != nil {
+		return
+	}
+
+	switch state {
+	case "inviting":
+		if s.isActiveTempleClient(leaderSessionID) {
+			s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+				Type: "command", Action: "start_boss_invite_cycle", TeamID: teamID,
+				CycleID: cycleID, TargetRoleName: bossRoleName,
+			})
+		}
+	case "casting":
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err = s.skipInactiveBossCycleParticipants(ctx, tx, teamID, cycleID); err != nil {
+			return
+		}
+		pending, err := ropeTeamPendingCycleSessionIDs(ctx, tx, teamID, cycleID)
+		if err != nil {
+			return
+		}
+		if len(pending) == 0 {
+			result, updateErr := tx.ExecContext(
+				ctx,
+				`UPDATE rope_teams SET boss_cycle_state = 'disbanding'
+				 WHERE id = ? AND boss_cycle_id = ? AND boss_cycle_state = 'casting'`,
+				teamID, cycleID,
+			)
+			if updateErr != nil {
+				return
+			}
+			changed, _ := result.RowsAffected()
+			if err = tx.Commit(); err != nil {
+				return
+			}
+			if changed > 0 {
+				s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+					Type: "command", Action: "disband_boss_party", TeamID: teamID, CycleID: cycleID,
+				})
+				s.hub.NotifyClients(userID)
+			}
+			return
+		}
+		if err = tx.Commit(); err != nil {
+			return
+		}
+		for _, memberSessionID := range pending {
+			s.hub.SendCommand(memberSessionID, protocol.ClientCommand{
+				Type: "command", Action: "cast_boss_buffs", TeamID: teamID, CycleID: cycleID,
+			})
+		}
+		s.hub.NotifyClients(userID)
+	case "disbanding":
+		if s.isActiveTempleClient(leaderSessionID) {
+			s.hub.SendCommand(leaderSessionID, protocol.ClientCommand{
+				Type: "command", Action: "disband_boss_party", TeamID: teamID, CycleID: cycleID,
+			})
+		}
+	}
+}
+
+func (s *Server) skipInactiveBossCycleParticipants(ctx context.Context, tx *sql.Tx, teamID, cycleID int64) error {
+	pending, err := ropeTeamPendingCycleSessionIDs(ctx, tx, teamID, cycleID)
+	if err != nil {
+		return err
+	}
+	for _, memberSessionID := range pending {
+		if s.isActiveTempleClient(memberSessionID) {
+			continue
+		}
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE rope_team_members SET boss_completed_cycle_id = ?
+			 WHERE team_id = ? AND session_id = ? AND boss_completed_cycle_id <> ?`,
+			cycleID, teamID, memberSessionID, cycleID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) markBossKicked(ctx context.Context, userID int64, sessionID string, progress protocol.RopePartyProgressPayload) {
 	result, err := s.db.ExecContext(
 		ctx,
@@ -313,14 +428,19 @@ func ropeTeamPendingCycleSessionIDs(ctx context.Context, tx *sql.Tx, teamID, cyc
 	return members, rows.Err()
 }
 
-func (s *Server) onlineClientSessionIDs(sessionIDs []string) []string {
+func (s *Server) activeTempleClientSessionIDs(sessionIDs []string) []string {
 	onlineSessionIDs := make([]string, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
-		if online, _, _ := s.hub.ClientStatus(sessionID); online {
+		if s.isActiveTempleClient(sessionID) {
 			onlineSessionIDs = append(onlineSessionIDs, sessionID)
 		}
 	}
 	return onlineSessionIDs
+}
+
+func (s *Server) isActiveTempleClient(sessionID string) bool {
+	connected, state, _ := s.hub.ClientStatus(sessionID)
+	return connected && state.Mode == "temple" && state.Running
 }
 
 func containsSessionID(sessionIDs []string, target string) bool {

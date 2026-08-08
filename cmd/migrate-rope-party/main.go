@@ -50,6 +50,14 @@ func main() {
         CONSTRAINT fk_rope_team_members_team FOREIGN KEY (team_id) REFERENCES rope_teams (id) ON DELETE CASCADE,
         CONSTRAINT fk_rope_team_members_session FOREIGN KEY (session_id) REFERENCES monitor_sessions (id) ON DELETE CASCADE
     ) ENGINE=InnoDB`)
+	ensureTable(db, "rope_join_receipts", `CREATE TABLE rope_join_receipts (
+        receipt_id VARCHAR(64) NOT NULL,
+        session_id CHAR(36) NOT NULL,
+        created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+        PRIMARY KEY (receipt_id),
+        KEY idx_rope_join_receipts_session (session_id),
+        CONSTRAINT fk_rope_join_receipts_session FOREIGN KEY (session_id) REFERENCES monitor_sessions (id) ON DELETE CASCADE
+    ) ENGINE=InnoDB`)
 	ensureTableColumn(db, "rope_teams", "created_in_game", `ALTER TABLE rope_teams
         ADD COLUMN created_in_game TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER leader_session_id`)
 	ensureTableColumn(db, "rope_team_members", "invited", `ALTER TABLE rope_team_members

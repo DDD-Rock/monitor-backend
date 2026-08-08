@@ -141,16 +141,24 @@ func TestValidateEnvelopeAcceptsTempleClientState(t *testing.T) {
 }
 
 func TestValidateEnvelopeAcceptsTeamJoined(t *testing.T) {
-	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色"}}`)
+	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色","receiptId":"receipt-123"}}`)
 	if _, err := ValidateEnvelope(message); err != nil {
 		t.Fatalf("expected valid team joined receipt, got %v", err)
 	}
 }
 
+func TestValidateEnvelopeAcceptsLegacyTeamJoinedWithoutReceipt(t *testing.T) {
+	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色"}}`)
+	if _, err := ValidateEnvelope(message); err != nil {
+		t.Fatalf("expected legacy team joined receipt to remain valid, got %v", err)
+	}
+}
+
 func TestValidateEnvelopeRejectsInvalidTeamJoined(t *testing.T) {
 	cases := []string{
-		`{"type":"team_joined","sequence":2,"payload":{"teamId":0,"roleName":"测试角色"}}`,
-		`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":""}}`,
+		`{"type":"team_joined","sequence":2,"payload":{"teamId":0,"roleName":"测试角色","receiptId":"receipt-123"}}`,
+		`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"","receiptId":"receipt-123"}}`,
+		`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色","receiptId":"short"}}`,
 	}
 	for _, message := range cases {
 		if _, err := ValidateEnvelope([]byte(message)); err == nil {
@@ -162,6 +170,7 @@ func TestValidateEnvelopeRejectsInvalidTeamJoined(t *testing.T) {
 func TestValidateEnvelopeAcceptsRopePartyProgress(t *testing.T) {
 	for _, message := range []string{
 		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created"}}`,
+		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created","receiptId":"receipt-123"}}`,
 		`{"type":"rope_party_progress","sequence":4,"payload":{"teamId":7,"event":"invitation_sent","roleName":"队员甲"}}`,
 		`{"type":"rope_party_progress","sequence":5,"payload":{"teamId":7,"event":"team_disbanded"}}`,
 		`{"type":"rope_party_progress","sequence":6,"payload":{"teamId":7,"event":"buff_due"}}`,
@@ -183,6 +192,7 @@ func TestValidateEnvelopeRejectsInvalidRopePartyProgress(t *testing.T) {
 		`{"type":"rope_party_progress","sequence":5,"payload":{"teamId":7,"event":"unknown"}}`,
 		`{"type":"rope_party_progress","sequence":6,"payload":{"teamId":7,"event":"boss_joined"}}`,
 		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"cycleId":3,"event":"buff_due"}}`,
+		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"event":"team_created","receiptId":"short"}}`,
 	} {
 		if _, err := ValidateEnvelope([]byte(message)); err == nil {
 			t.Fatal("expected invalid rope party progress to be rejected")

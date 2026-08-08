@@ -85,19 +85,22 @@ type ClientCommand struct {
 	RoleName        string   `json:"roleName,omitempty"`
 	TargetRoleName  string   `json:"targetRoleName,omitempty"`
 	CycleID         int64    `json:"cycleId,omitempty"`
+	ReceiptID       string   `json:"receiptId,omitempty"`
 	InviteRoleNames []string `json:"inviteRoleNames,omitempty"`
 }
 
 type TeamJoinedPayload struct {
-	TeamID   int64  `json:"teamId"`
-	RoleName string `json:"roleName"`
+	TeamID    int64  `json:"teamId"`
+	RoleName  string `json:"roleName"`
+	ReceiptID string `json:"receiptId"`
 }
 
 type RopePartyProgressPayload struct {
-	TeamID   int64  `json:"teamId"`
-	CycleID  int64  `json:"cycleId,omitempty"`
-	Event    string `json:"event"`
-	RoleName string `json:"roleName,omitempty"`
+	TeamID    int64  `json:"teamId"`
+	CycleID   int64  `json:"cycleId,omitempty"`
+	Event     string `json:"event"`
+	RoleName  string `json:"roleName,omitempty"`
+	ReceiptID string `json:"receiptId,omitempty"`
 }
 
 type EXPPayload struct {
@@ -289,12 +292,14 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 	case TypeTeamJoined:
 		var payload TeamJoinedPayload
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil ||
-			payload.TeamID <= 0 || len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 {
+			payload.TeamID <= 0 || len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 ||
+			(len(payload.ReceiptID) > 0 && (len(payload.ReceiptID) < 8 || len(payload.ReceiptID) > 64)) {
 			return Envelope{}, errors.New("invalid team joined payload")
 		}
 	case TypeRopeProgress:
 		var payload RopePartyProgressPayload
-		if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.TeamID <= 0 {
+		if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.TeamID <= 0 ||
+			(len(payload.ReceiptID) > 0 && (len(payload.ReceiptID) < 8 || len(payload.ReceiptID) > 64)) {
 			return Envelope{}, errors.New("invalid rope party progress payload")
 		}
 		switch payload.Event {

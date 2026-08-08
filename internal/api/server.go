@@ -586,7 +586,12 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	connectionID, _ := randomUUID()
 	controls, detach := s.hub.AttachDevice(sessionID, user.ID, connectionID)
-	defer detach()
+	defer func() {
+		detach()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.reconcileBossBuffCycle(ctx, user.ID)
+	}()
 	_, _ = s.db.ExecContext(r.Context(), `UPDATE monitor_sessions SET last_publish_at = NOW(3) WHERE id = ?`, sessionID)
 
 	identity, _ := json.Marshal(map[string]any{
@@ -669,38 +674,88 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						state.Mode, state.Running, sessionID,
 					)
 					s.resumePendingBossBuffCycle(r.Context(), user.ID, sessionID)
+					s.reconcileBossBuffCycle(r.Context(), user.ID)
 				}
 			}
 			if envelope.Type == protocol.TypeTeamJoined {
 				var joined protocol.TeamJoinedPayload
 				if json.Unmarshal(envelope.Payload, &joined) == nil {
-					result, updateErr := s.db.ExecContext(
-						r.Context(),
-						`UPDATE rope_team_members rtm
-						 JOIN rope_teams rt ON rt.id = rtm.team_id
-						 JOIN monitor_sessions ms ON ms.id = rtm.session_id
-						 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
-						 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?
-						   AND ms.role_name = ?`,
-						joined.TeamID, sessionID, user.ID, joined.RoleName,
-					)
+					var result sql.Result
+					var updateErr error
+					if joined.ReceiptID == "" {
+						result, updateErr = s.db.ExecContext(
+							r.Context(),
+							`UPDATE rope_team_members rtm
+							 JOIN rope_teams rt ON rt.id = rtm.team_id
+							 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
+							 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
+							joined.TeamID, sessionID, user.ID,
+						)
+					} else {
+						tx, beginErr := s.db.BeginTx(r.Context(), nil)
+						if beginErr != nil {
+							updateErr = beginErr
+						} else {
+							receiptResult, receiptErr := tx.ExecContext(
+								r.Context(),
+								`INSERT IGNORE INTO rope_join_receipts (receipt_id, session_id)
+								 SELECT ?, ?
+								 WHERE EXISTS (
+								   SELECT 1 FROM rope_team_members rtm
+								   JOIN rope_teams rt ON rt.id = rtm.team_id
+								   WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?
+								 )`,
+								joined.ReceiptID, sessionID, joined.TeamID, sessionID, user.ID,
+							)
+							if receiptErr != nil {
+								_ = tx.Rollback()
+								updateErr = receiptErr
+							} else if inserted, _ := receiptResult.RowsAffected(); inserted == 0 {
+								updateErr = tx.Commit()
+								result = receiptResult
+							} else {
+								result, updateErr = tx.ExecContext(
+									r.Context(),
+									`UPDATE rope_team_members rtm
+									 JOIN rope_teams rt ON rt.id = rtm.team_id
+									 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
+									 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
+									joined.TeamID, sessionID, user.ID,
+								)
+								if updateErr != nil {
+									_ = tx.Rollback()
+								} else {
+									updateErr = tx.Commit()
+								}
+							}
+						}
+					}
 					if updateErr == nil {
 						if affected, _ := result.RowsAffected(); affected > 0 {
 							s.hub.NotifyClients(user.ID)
 						}
 						var confirmed int
-						_ = s.db.QueryRowContext(
-							r.Context(),
-							`SELECT COUNT(*) FROM rope_team_members rtm
-							 JOIN rope_teams rt ON rt.id = rtm.team_id
-							 WHERE rtm.team_id = ? AND rtm.session_id = ?
-							   AND rt.user_id = ? AND rtm.joined = 1
-							   AND EXISTS (SELECT 1 FROM monitor_sessions ms WHERE ms.id = rtm.session_id AND ms.role_name = ?)`,
-							joined.TeamID, sessionID, user.ID, joined.RoleName,
-						).Scan(&confirmed)
+						if joined.ReceiptID == "" {
+							_ = s.db.QueryRowContext(
+								r.Context(),
+								`SELECT COUNT(*) FROM rope_team_members rtm
+								 JOIN rope_teams rt ON rt.id = rtm.team_id
+								 WHERE rtm.team_id = ? AND rtm.session_id = ?
+								   AND rt.user_id = ? AND rtm.joined = 1`,
+								joined.TeamID, sessionID, user.ID,
+							).Scan(&confirmed)
+						} else {
+							_ = s.db.QueryRowContext(
+								r.Context(),
+								`SELECT COUNT(*) FROM rope_join_receipts
+								 WHERE receipt_id = ? AND session_id = ?`,
+								joined.ReceiptID, sessionID,
+							).Scan(&confirmed)
+						}
 						if confirmed > 0 {
 							s.hub.SendCommand(sessionID, protocol.ClientCommand{
 								Type: "command", Action: "team_joined_ack", TeamID: joined.TeamID,
+								ReceiptID: joined.ReceiptID,
 							})
 						}
 					}
@@ -709,20 +764,33 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 			if envelope.Type == protocol.TypeRopeProgress {
 				var progress protocol.RopePartyProgressPayload
 				if json.Unmarshal(envelope.Payload, &progress) == nil {
+					ackProgress := func() {
+						if progress.ReceiptID == "" {
+							return
+						}
+						s.hub.SendCommand(sessionID, protocol.ClientCommand{
+							Type: "command", Action: "rope_progress_ack", TeamID: progress.TeamID,
+							CycleID: progress.CycleID, ReceiptID: progress.ReceiptID,
+						})
+					}
 					var result sql.Result
 					var updateErr error
 					switch progress.Event {
 					case "buff_due":
 						_, _ = s.startBossBuffCycle(r.Context(), user.ID, sessionID)
+						ackProgress()
 						continue
 					case "boss_joined":
 						s.markBossJoined(r.Context(), user.ID, sessionID, progress)
+						ackProgress()
 						continue
 					case "buff_completed":
 						s.markBossBuffCompleted(r.Context(), user.ID, sessionID, progress)
+						ackProgress()
 						continue
 					case "boss_kicked":
 						s.markBossKicked(r.Context(), user.ID, sessionID, progress)
+						ackProgress()
 						continue
 					case "boss_cycle_disbanded":
 						result, updateErr = s.db.ExecContext(
@@ -734,12 +802,14 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 							progress.TeamID, user.ID, sessionID, progress.CycleID,
 						)
 						if updateErr == nil {
-							_, updateErr = s.db.ExecContext(
-								r.Context(),
-								`UPDATE rope_team_members SET invited = 0, joined = 0,
-								        joined_at = NULL, boss_completed_cycle_id = 0
-							 WHERE team_id = ?`, progress.TeamID,
-							)
+							if affected, _ := result.RowsAffected(); affected > 0 {
+								_, updateErr = s.db.ExecContext(
+									r.Context(),
+									`UPDATE rope_team_members SET invited = 0, joined = 0,
+									        joined_at = NULL, boss_completed_cycle_id = 0
+									 WHERE team_id = ?`, progress.TeamID,
+								)
+							}
 						}
 					}
 					switch progress.Event {
@@ -782,6 +852,9 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						if affected, _ := result.RowsAffected(); affected > 0 {
 							s.hub.NotifyClients(user.ID)
 						}
+					}
+					if updateErr == nil {
+						ackProgress()
 					}
 				}
 			}

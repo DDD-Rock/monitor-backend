@@ -67,6 +67,50 @@ func TestDeviceReceivesControlAndClientObserverIsNotified(t *testing.T) {
 	}
 }
 
+func TestDeviceReceivesRapidCommandsInFIFOOrder(t *testing.T) {
+	hub := NewHub()
+	defer hub.Close()
+
+	controls, detach := hub.AttachDevice("session-rapid", 42, "publisher-rapid")
+	defer detach()
+
+	const total = 100
+	received := make(chan int64, total)
+	decodeErrors := make(chan error, 1)
+	go func() {
+		for index := 0; index < total; index++ {
+			raw := <-controls
+			var command protocol.ClientCommand
+			if err := json.Unmarshal(raw, &command); err != nil {
+				decodeErrors <- err
+				return
+			}
+			received <- command.CycleID
+		}
+	}()
+
+	for index := 0; index < total; index++ {
+		if !hub.SendCommand("session-rapid", protocol.ClientCommand{
+			Type: "command", Action: "configure_rope_party", CycleID: int64(index + 1),
+		}) {
+			t.Fatalf("command %d was unexpectedly rejected", index+1)
+		}
+	}
+
+	for index := 0; index < total; index++ {
+		select {
+		case err := <-decodeErrors:
+			t.Fatalf("decode command %d: %v", index+1, err)
+		case cycleID := <-received:
+			if cycleID != int64(index+1) {
+				t.Fatalf("expected command %d, got %d", index+1, cycleID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for command %d", index+1)
+		}
+	}
+}
+
 func TestClientConnectionDoesNotMarkStoppedMonitorOnline(t *testing.T) {
 	hub := NewHub()
 	defer hub.Close()

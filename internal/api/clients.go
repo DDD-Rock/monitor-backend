@@ -145,7 +145,8 @@ func (s *Server) ropeTeam(ctx context.Context, userID int64) (*ropeTeamItem, err
 		member.Joined = joined == 1
 		member.Invited = invited == 1
 		member.BossBuffCompleted = team.BossCycleID > 0 && completedCycleID == team.BossCycleID
-		member.Online, _, _ = s.hub.ClientStatus(member.SessionID)
+		connected, state, _ := s.hub.ClientStatus(member.SessionID)
+		member.Online = connected && state.Mode == "temple" && state.Running
 		team.Members = append(team.Members, member)
 	}
 	return &team, rows.Err()
@@ -198,7 +199,7 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 				s.internalError(w, "reload active rope team boss failed", loadErr)
 				return
 			}
-			leaderOnline, _, _ := s.hub.ClientStatus(leaderSessionID)
+			leaderOnline := s.isActiveTempleClient(leaderSessionID)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"team":          team,
 				"cycleStarted":  false,
@@ -215,7 +216,7 @@ func (s *Server) handleSaveRopeTeamBoss(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusConflict, "rope_team_not_created", "请等待队长客户端完成游戏内建队")
 		return
 	}
-	leaderOnline, _, _ := s.hub.ClientStatus(leaderSessionID)
+	leaderOnline := s.isActiveTempleClient(leaderSessionID)
 	cycleStarted := false
 	startReason := "leader_offline"
 	if leaderOnline {
@@ -374,6 +375,7 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 	var teamID int64
 	firstCreation := false
 	previousLeaderSessionID := ""
+	previousState := "idle"
 	leaderChanging := false
 	err = tx.QueryRowContext(
 		r.Context(),
@@ -393,7 +395,18 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 		teamID, err = result.LastInsertId()
 		firstCreation = true
 	} else if err == nil {
-		_ = tx.QueryRowContext(r.Context(), `SELECT leader_session_id FROM rope_teams WHERE id = ? FOR UPDATE`, teamID).Scan(&previousLeaderSessionID)
+		if loadErr := tx.QueryRowContext(
+			r.Context(),
+			`SELECT leader_session_id, boss_cycle_state FROM rope_teams WHERE id = ? FOR UPDATE`,
+			teamID,
+		).Scan(&previousLeaderSessionID, &previousState); loadErr != nil {
+			s.internalError(w, "load rope team transition state failed", loadErr)
+			return
+		}
+		if previousState != "idle" {
+			writeError(w, http.StatusConflict, "team_transition_in_progress", "当前队伍流程尚未结束，请完成后再修改队伍")
+			return
+		}
 		leaderChanging = previousLeaderSessionID != "" && previousLeaderSessionID != request.LeaderSessionID
 		if leaderChanging {
 			if online, _, _ := s.hub.ClientStatus(previousLeaderSessionID); !online {
@@ -440,7 +453,17 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 
 	inviteRoleNames := make([]string, 0, len(request.MemberSessionIDs)-1)
 	if leaderChanging {
-		s.hub.SendCommand(previousLeaderSessionID, protocol.ClientCommand{Type: "command", Action: "disband_rope_party", TeamID: teamID})
+		if !s.hub.SendCommand(previousLeaderSessionID, protocol.ClientCommand{Type: "command", Action: "disband_rope_party", TeamID: teamID}) {
+			_, _ = s.db.ExecContext(
+				r.Context(),
+				`UPDATE rope_teams SET boss_cycle_state = 'idle'
+				 WHERE id = ? AND user_id = ? AND boss_cycle_state = 'changing_leader'`,
+				teamID, userID,
+			)
+			s.hub.NotifyClients(userID)
+			writeError(w, http.StatusConflict, "previous_leader_unavailable", "旧队长客户端暂时无法接收退出指令，请稍后重新保存队伍")
+			return
+		}
 		s.hub.NotifyClients(userID)
 		team, loadErr := s.ropeTeam(r.Context(), userID)
 		if loadErr != nil {
@@ -455,6 +478,7 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 			inviteRoleNames = append(inviteRoleNames, roleNames[sessionID])
 		}
 	}
+	failedSessionIDs := make([]string, 0)
 	for _, sessionID := range request.MemberSessionIDs {
 		command := protocol.ClientCommand{
 			Type:     "command",
@@ -469,9 +493,15 @@ func (s *Server) handleSaveRopeTeam(w http.ResponseWriter, r *http.Request) {
 		if command.IsLeader {
 			command.InviteRoleNames = inviteRoleNames
 		}
-		s.hub.SendCommand(sessionID, command)
+		if !s.hub.SendCommand(sessionID, command) {
+			failedSessionIDs = append(failedSessionIDs, sessionID)
+		}
 	}
 	s.hub.NotifyClients(userID)
+	if len(failedSessionIDs) > 0 {
+		writeError(w, http.StatusConflict, "team_clients_unavailable", "部分客户端暂时无法接收队伍配置，请稍后重新保存队伍")
+		return
+	}
 	team, loadErr := s.ropeTeam(r.Context(), userID)
 	if loadErr != nil {
 		s.internalError(w, "reload rope team failed", loadErr)
@@ -508,8 +538,19 @@ func (s *Server) configureSavedRopeTeam(ctx context.Context, userID, teamID int6
 			invites = append(invites, item.role)
 		}
 	}
+	allSent := true
 	for _, item := range members {
-		s.hub.SendCommand(item.id, protocol.ClientCommand{Type: "command", Action: "configure_rope_party", TeamID: teamID, IsLeader: item.leader, FirstCreation: true, RoleName: item.role, InviteRoleNames: invites})
+		if !s.hub.SendCommand(item.id, protocol.ClientCommand{Type: "command", Action: "configure_rope_party", TeamID: teamID, IsLeader: item.leader, FirstCreation: true, RoleName: item.role, InviteRoleNames: invites}) {
+			allSent = false
+		}
+	}
+	if !allSent {
+		_, _ = s.db.ExecContext(
+			ctx,
+			`UPDATE rope_teams SET created_in_game = 0, boss_cycle_state = 'idle'
+			 WHERE id = ? AND user_id = ?`,
+			teamID, userID,
+		)
 	}
 	s.hub.NotifyClients(userID)
 }
@@ -529,6 +570,34 @@ func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		s.internalError(w, "load rope team for delete failed", err)
+		return
+	}
+	rows, err := s.db.QueryContext(
+		r.Context(),
+		`SELECT session_id FROM rope_team_members WHERE team_id = ?`,
+		teamID,
+	)
+	if err != nil {
+		s.internalError(w, "load rope team members for delete failed", err)
+		return
+	}
+	memberSessionIDs := make([]string, 0, 5)
+	for rows.Next() {
+		var memberSessionID string
+		if scanErr := rows.Scan(&memberSessionID); scanErr != nil {
+			rows.Close()
+			s.internalError(w, "scan rope team member for delete failed", scanErr)
+			return
+		}
+		memberSessionIDs = append(memberSessionIDs, memberSessionID)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		rows.Close()
+		s.internalError(w, "iterate rope team members for delete failed", rowsErr)
+		return
+	}
+	if rowsErr := rows.Close(); rowsErr != nil {
+		s.internalError(w, "close rope team members for delete failed", rowsErr)
 		return
 	}
 	result, err := s.db.ExecContext(
@@ -553,6 +622,14 @@ func (s *Server) handleDeleteRopeTeam(w http.ResponseWriter, r *http.Request) {
 		Action: "disband_rope_party",
 		TeamID: teamID,
 	})
+	for _, memberSessionID := range memberSessionIDs {
+		if memberSessionID == leaderSessionID {
+			continue
+		}
+		s.hub.SendCommand(memberSessionID, protocol.ClientCommand{
+			Type: "command", Action: "clear_rope_party", TeamID: teamID,
+		})
+	}
 	s.hub.NotifyClients(userID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"teamId":      teamID,
@@ -627,6 +704,9 @@ func (s *Server) handleRemoveRopeTeamMember(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusNotFound, "rope_team_member_not_found", "该成员不在当前挂绳队伍中")
 		return
 	}
+	s.hub.SendCommand(sessionID, protocol.ClientCommand{
+		Type: "command", Action: "clear_rope_party", TeamID: teamID,
+	})
 	s.hub.NotifyClients(userID)
 	team, loadErr := s.ropeTeam(r.Context(), userID)
 	if loadErr != nil {

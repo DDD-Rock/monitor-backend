@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"autobuff-monitor/server/internal/protocol"
@@ -37,12 +38,11 @@ const (
 	ZoneBreachIntervalSeconds = 5
 	// 与符文同理：Mac 端心跳停止后，最后一次「已越界」的上报很快过期。
 	ZoneBreachFreshnessWindow = 12 * time.Second
-	// 调度器每 5 秒扫一次，而 last_sent_at 记录的是这一轮推送完成的时刻，
-	// 总是比 tick 晚若干毫秒。不留容差的话每条规则都会顺延整整一个周期
-	// （5 秒变 10 秒、60 秒变 65 秒），因此允许提前 1 秒触发。
-	scheduleSlack = time.Second
-	// 调度器扫描周期，容差必须小于它，否则同一周期内会重复推送。
-	scheduleInterval = 5 * time.Second
+	// 四类告警统一每秒检查；安全区自身的 1.5 秒防抖仍由客户端负责。
+	scheduleInterval = time.Second
+	// last_sent_at 会比调度 tick 晚几毫秒，留少量容差避免重复提醒被顺延一秒。
+	// 容差必须小于扫描周期，否则可能提前一个完整周期推送。
+	scheduleSlack = 200 * time.Millisecond
 )
 
 var barkDeviceKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
@@ -62,13 +62,17 @@ type Settings struct {
 }
 
 type Service struct {
-	db            *sql.DB
-	hub           *realtime.Hub
-	box           *secretBox
-	bark          *barkSender
-	publicBaseURL string
-	publicBarkURL string
-	logger        *slog.Logger
+	db                      *sql.DB
+	hub                     *realtime.Hub
+	box                     *secretBox
+	bark                    *barkSender
+	publicBaseURL           string
+	publicBarkURL           string
+	logger                  *slog.Logger
+	expStallScanRunning     atomic.Bool
+	runeAlertScanRunning    atomic.Bool
+	verificationScanRunning atomic.Bool
+	zoneBreachScanRunning   atomic.Bool
 }
 
 func NewService(
@@ -389,22 +393,40 @@ func (s *Service) deviceKey(ctx context.Context, userID int64) (string, error) {
 func (s *Service) Start(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(scheduleInterval)
-		urgentTicker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		defer urgentTicker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				s.processEXPStalls(ctx)
-				s.processDueZoneBreaches(ctx)
-			case <-urgentTicker.C:
-				s.processDueRuneAlerts(ctx)
-				s.processDueMouseFollowVerifications(ctx)
+				s.startScheduledScan(ctx, &s.expStallScanRunning, s.processEXPStalls)
+				s.startScheduledScan(ctx, &s.runeAlertScanRunning, s.processDueRuneAlerts)
+				s.startScheduledScan(
+					ctx,
+					&s.verificationScanRunning,
+					s.processDueMouseFollowVerifications,
+				)
+				s.startScheduledScan(ctx, &s.zoneBreachScanRunning, s.processDueZoneBreaches)
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+// startScheduledScan keeps slow database work from blocking the other alert
+// types while preventing overlapping scans of the same type.
+func (s *Service) startScheduledScan(
+	ctx context.Context,
+	running *atomic.Bool,
+	scan func(context.Context),
+) bool {
+	if !running.CompareAndSwap(false, true) {
+		return false
+	}
+	go func() {
+		defer running.Store(false)
+		scan(ctx)
+	}()
+	return true
 }
 
 type stalledEXPRule struct {
@@ -509,21 +531,20 @@ func (s *Service) evaluateEXPStall(ctx context.Context, rule stalledEXPRule, now
 	); err != nil {
 		s.logger.Error("update EXP stalled notification time failed", "user_id", rule.UserID, "error", err)
 	}
-	deviceKey, err := s.box.open(rule.SecretCiphertext)
-	if err == nil {
-		stalledSeconds := int64(normalizeStallSeconds(rule.ThresholdSeconds)) * int64(count)
-		body := fmt.Sprintf(
-			"%d秒经验无增长，疑似卡技能\nEXP %s · %s%%",
-			stalledSeconds,
-			formatInteger(*exp.CurrentEXP),
-			formatPercent(*exp.Percent),
-		)
-		err = s.bark.push(ctx, deviceKey, body, "")
-	}
-	s.recordDelivery(ctx, rule.UserID, RuleEXPStalled, err)
-	if err != nil {
-		s.logger.Warn("send Bark EXP stalled notification failed", "user_id", rule.UserID, "error", err)
-	}
+	stalledSeconds := int64(normalizeStallSeconds(rule.ThresholdSeconds)) * int64(count)
+	body := fmt.Sprintf(
+		"%d秒经验无增长，疑似卡技能\nEXP %s · %s%%",
+		stalledSeconds,
+		formatInteger(*exp.CurrentEXP),
+		formatPercent(*exp.Percent),
+	)
+	s.dispatchBark(ctx, rule.UserID, RuleEXPStalled, func(ctx context.Context) error {
+		deviceKey, err := s.box.open(rule.SecretCiphertext)
+		if err != nil {
+			return err
+		}
+		return s.bark.push(ctx, deviceKey, body, "")
+	})
 }
 
 func (s *Service) reserveEXPStallNotification(
@@ -699,20 +720,19 @@ func (s *Service) sendRuneAlert(ctx context.Context, item dueRuneAlertRule, now 
 		s.logger.Error("reserve rune alert schedule failed", "user_id", item.UserID, "error", err)
 		return
 	}
-	deviceKey, err := s.box.open(item.SecretCiphertext)
-	if err == nil {
-		err = s.bark.pushCriticalWithURL(
+	s.dispatchBark(ctx, item.UserID, RuleRuneAlert, func(ctx context.Context) error {
+		deviceKey, err := s.box.open(item.SecretCiphertext)
+		if err != nil {
+			return err
+		}
+		return s.bark.pushCriticalWithURL(
 			ctx,
 			deviceKey,
 			"出现紫色符文，尽快解除！",
 			s.publicBaseURL,
 			urgentAlertVolume(!item.LastSentAt.Valid, item.UrgentMuted),
 		)
-	}
-	s.recordDelivery(ctx, item.UserID, RuleRuneAlert, err)
-	if err != nil {
-		s.logger.Warn("send Bark rune alert failed", "user_id", item.UserID, "error", err)
-	}
+	})
 }
 
 // runeAlertActive 判断上报的符文状态是否既处于「出现」又足够新鲜。
@@ -828,26 +848,19 @@ func (s *Service) sendMouseFollowVerification(
 		)
 		return
 	}
-	deviceKey, err := s.box.open(item.SecretCiphertext)
-	if err == nil {
-		err = s.bark.pushCriticalWithURL(
+	s.dispatchBark(ctx, item.UserID, RuleMouseFollowVerification, func(ctx context.Context) error {
+		deviceKey, err := s.box.open(item.SecretCiphertext)
+		if err != nil {
+			return err
+		}
+		return s.bark.pushCriticalWithURL(
 			ctx,
 			deviceKey,
 			"出现鼠标跟随验证，请立即处理！",
 			s.publicBaseURL,
 			urgentAlertVolume(!item.LastSentAt.Valid, item.UrgentMuted),
 		)
-	}
-	s.recordDelivery(ctx, item.UserID, RuleMouseFollowVerification, err)
-	if err != nil {
-		s.logger.Warn(
-			"send Bark mouse follow verification failed",
-			"user_id",
-			item.UserID,
-			"error",
-			err,
-		)
-	}
+	})
 }
 
 func mouseFollowVerificationActive(
@@ -973,14 +986,13 @@ func (s *Service) sendZoneBreach(ctx context.Context, item dueZoneBreachRule, no
 		s.logger.Error("reserve zone breach schedule failed", "user_id", item.UserID, "error", err)
 		return
 	}
-	deviceKey, err := s.box.open(item.SecretCiphertext)
-	if err == nil {
-		err = s.bark.push(ctx, deviceKey, "角色已离开安全区，请尽快查看！", s.publicBaseURL)
-	}
-	s.recordDelivery(ctx, item.UserID, RuleZoneBreach, err)
-	if err != nil {
-		s.logger.Warn("send Bark zone breach failed", "user_id", item.UserID, "error", err)
-	}
+	s.dispatchBark(ctx, item.UserID, RuleZoneBreach, func(ctx context.Context) error {
+		deviceKey, err := s.box.open(item.SecretCiphertext)
+		if err != nil {
+			return err
+		}
+		return s.bark.push(ctx, deviceKey, "角色已离开安全区，请尽快查看！", s.publicBaseURL)
+	})
 }
 
 // zoneBreachActive 判断上报的安全区状态是否既处于「已越界」又足够新鲜。
@@ -993,6 +1005,31 @@ func zoneBreachActive(payload protocol.ZonePayload, now time.Time) bool {
 	}
 	age := now.Sub(time.UnixMilli(payload.DetectedAt))
 	return age >= -ZoneBreachFreshnessWindow && age <= ZoneBreachFreshnessWindow
+}
+
+// dispatchBark runs the external HTTP request outside the scan worker. The
+// caller must reserve the rule/state first so the next scan cannot duplicate it.
+func (s *Service) dispatchBark(
+	ctx context.Context,
+	userID int64,
+	eventType string,
+	send func(context.Context) error,
+) {
+	go func() {
+		err := send(ctx)
+		s.recordDelivery(ctx, userID, eventType, err)
+		if err != nil {
+			s.logger.Warn(
+				"send Bark notification failed",
+				"user_id",
+				userID,
+				"event_type",
+				eventType,
+				"error",
+				err,
+			)
+		}
+	}()
 }
 
 func (s *Service) recordDelivery(ctx context.Context, userID int64, eventType string, sendError error) {

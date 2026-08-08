@@ -78,7 +78,7 @@ func TestZoneBreachRepeatsEveryFiveSeconds(t *testing.T) {
 	if ZoneBreachFreshnessWindow <= ZoneBreachIntervalSeconds*time.Second {
 		t.Fatal("新鲜度窗口应明显大于推送间隔")
 	}
-	// 调度周期等于推送间隔，必须依赖容差，否则会顺延成 10 秒。
+	// 少量容差用于抵消调度 tick 与 last_sent_at 写入之间的毫秒级偏差。
 	if scheduleSlack <= 0 || scheduleSlack >= scheduleInterval {
 		t.Fatalf("调度容差 %s 必须为正且小于扫描周期 %s", scheduleSlack, scheduleInterval)
 	}

@@ -87,7 +87,7 @@ func TestRuneAlertRepeatsEveryFiveSeconds(t *testing.T) {
 	if RuneAlertFreshnessWindow <= RuneAlertIntervalSeconds*time.Second {
 		t.Fatal("新鲜度窗口应明显大于推送间隔")
 	}
-	// 调度周期正好等于推送间隔，没有容差就会每次都差几毫秒而顺延成 10 秒。
+	// 调度时间和写入时间会相差几毫秒；容差可避免重复提醒额外顺延一次扫描。
 	if scheduleInterval > RuneAlertIntervalSeconds*time.Second && scheduleSlack == 0 {
 		t.Fatal("调度周期不小于推送间隔时必须留出容差")
 	}

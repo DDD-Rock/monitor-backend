@@ -51,13 +51,13 @@ mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
 mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration.sql
 ```
 
-挂绳组队与角色名称功能升级还需执行：
+挂绳组队运行状态改为内存管理后，部署新版后端再删除旧运行状态表：
 
 ```bash
-mysql -u root -p autobuff_monitor < migrations/rope_party_migration.sql
+mysql -u root -p autobuff_monitor < migrations/drop_rope_party_runtime_tables.sql
 ```
 
-先执行数据库迁移，再替换并重启后端；旧后端不认识新增客户端协议。
+`monitor_sessions.role_name` 继续保留。不能在旧后端仍运行时执行删表 SQL。
 
 云端地图标注功能还需执行一次：
 

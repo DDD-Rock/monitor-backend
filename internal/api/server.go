@@ -56,6 +56,7 @@ type Server struct {
 	hub     *realtime.Hub
 	notify  *notification.Service
 	expGain *expgain.Service
+	rope    *ropePartyManager
 	logger  *slog.Logger
 }
 
@@ -75,6 +76,7 @@ func NewServer(
 		hub:     hub,
 		notify:  notificationService,
 		expGain: expGainService,
+		rope:    newRopePartyManager(),
 		logger:  logger,
 	}
 }
@@ -90,11 +92,12 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /api/clients/authorization", s.requireAuth(http.HandlerFunc(s.handleClientAuthorization)))
 	mux.Handle("DELETE /api/clients/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleDeleteClient)))
 	mux.Handle("PUT /api/clients/role-name", s.requireAuth(http.HandlerFunc(s.handleSaveClientRoleName)))
-	mux.Handle("GET /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleRopeTeam)))
-	mux.Handle("PUT /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeam)))
-	mux.Handle("PUT /api/rope-team/boss", s.requireAuth(http.HandlerFunc(s.handleSaveRopeTeamBoss)))
-	mux.Handle("DELETE /api/rope-team/members/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleRemoveRopeTeamMember)))
-	mux.Handle("DELETE /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleDeleteRopeTeam)))
+	mux.Handle("GET /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleMemoryRopeTeam)))
+	mux.Handle("PUT /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleCreateMemoryRopeTeam)))
+	mux.Handle("PUT /api/rope-team/boss", s.requireAuth(http.HandlerFunc(s.handleUpdateMemoryRopeBoss)))
+	mux.Handle("POST /api/rope-team/restart", s.requireAuth(http.HandlerFunc(s.handleRestartMemoryRopeTeam)))
+	mux.Handle("DELETE /api/rope-team/members/{sessionId}", s.requireAuth(http.HandlerFunc(s.handleRemoveMemoryRopeMember)))
+	mux.Handle("DELETE /api/rope-team", s.requireAuth(http.HandlerFunc(s.handleDeleteMemoryRopeTeam)))
 	mux.Handle("GET /api/admin/users", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUsers)))
 	mux.Handle("PATCH /api/admin/users/{id}/status", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserStatus)))
 	mux.Handle("PUT /api/admin/users/{id}/password", s.requireSuperAdmin(http.HandlerFunc(s.handleAdminUserPassword)))
@@ -586,12 +589,7 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	connectionID, _ := randomUUID()
 	controls, detach := s.hub.AttachDevice(sessionID, user.ID, connectionID)
-	defer func() {
-		detach()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		s.reconcileBossBuffCycle(ctx, user.ID)
-	}()
+	defer detach()
 	_, _ = s.db.ExecContext(r.Context(), `UPDATE monitor_sessions SET last_publish_at = NOW(3) WHERE id = ?`, sessionID)
 
 	identity, _ := json.Marshal(map[string]any{
@@ -673,190 +671,21 @@ func (s *Server) handleDeviceWebSocket(w http.ResponseWriter, r *http.Request) {
 						`UPDATE monitor_sessions SET mode = ?, running = ?, last_publish_at = NOW(3) WHERE id = ?`,
 						state.Mode, state.Running, sessionID,
 					)
-					s.resumePendingBossBuffCycle(r.Context(), user.ID, sessionID)
-					s.reconcileBossBuffCycle(r.Context(), user.ID)
 				}
 			}
 			if envelope.Type == protocol.TypeTeamJoined {
 				var joined protocol.TeamJoinedPayload
 				if json.Unmarshal(envelope.Payload, &joined) == nil {
-					var result sql.Result
-					var updateErr error
-					if joined.ReceiptID == "" {
-						result, updateErr = s.db.ExecContext(
-							r.Context(),
-							`UPDATE rope_team_members rtm
-							 JOIN rope_teams rt ON rt.id = rtm.team_id
-							 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
-							 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
-							joined.TeamID, sessionID, user.ID,
-						)
-					} else {
-						tx, beginErr := s.db.BeginTx(r.Context(), nil)
-						if beginErr != nil {
-							updateErr = beginErr
-						} else {
-							receiptResult, receiptErr := tx.ExecContext(
-								r.Context(),
-								`INSERT IGNORE INTO rope_join_receipts (receipt_id, session_id)
-								 SELECT ?, ?
-								 WHERE EXISTS (
-								   SELECT 1 FROM rope_team_members rtm
-								   JOIN rope_teams rt ON rt.id = rtm.team_id
-								   WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?
-								 )`,
-								joined.ReceiptID, sessionID, joined.TeamID, sessionID, user.ID,
-							)
-							if receiptErr != nil {
-								_ = tx.Rollback()
-								updateErr = receiptErr
-							} else if inserted, _ := receiptResult.RowsAffected(); inserted == 0 {
-								updateErr = tx.Commit()
-								result = receiptResult
-							} else {
-								result, updateErr = tx.ExecContext(
-									r.Context(),
-									`UPDATE rope_team_members rtm
-									 JOIN rope_teams rt ON rt.id = rtm.team_id
-									 SET rtm.invited = 1, rtm.joined = 1, rtm.joined_at = NOW(3)
-									 WHERE rtm.team_id = ? AND rtm.session_id = ? AND rt.user_id = ?`,
-									joined.TeamID, sessionID, user.ID,
-								)
-								if updateErr != nil {
-									_ = tx.Rollback()
-								} else {
-									updateErr = tx.Commit()
-								}
-							}
-						}
-					}
-					if updateErr == nil {
-						if affected, _ := result.RowsAffected(); affected > 0 {
-							s.hub.NotifyClients(user.ID)
-						}
-						var confirmed int
-						if joined.ReceiptID == "" {
-							_ = s.db.QueryRowContext(
-								r.Context(),
-								`SELECT COUNT(*) FROM rope_team_members rtm
-								 JOIN rope_teams rt ON rt.id = rtm.team_id
-								 WHERE rtm.team_id = ? AND rtm.session_id = ?
-								   AND rt.user_id = ? AND rtm.joined = 1`,
-								joined.TeamID, sessionID, user.ID,
-							).Scan(&confirmed)
-						} else {
-							_ = s.db.QueryRowContext(
-								r.Context(),
-								`SELECT COUNT(*) FROM rope_join_receipts
-								 WHERE receipt_id = ? AND session_id = ?`,
-								joined.ReceiptID, sessionID,
-							).Scan(&confirmed)
-						}
-						if confirmed > 0 {
-							s.hub.SendCommand(sessionID, protocol.ClientCommand{
-								Type: "command", Action: "team_joined_ack", TeamID: joined.TeamID,
-								ReceiptID: joined.ReceiptID,
-							})
-						}
-					}
+					s.handleMemoryRopeEvent(r.Context(), user.ID, sessionID, protocol.RopePartyProgressPayload{TeamID: joined.TeamID, Event: "team_joined"})
 				}
+				continue
 			}
 			if envelope.Type == protocol.TypeRopeProgress {
 				var progress protocol.RopePartyProgressPayload
 				if json.Unmarshal(envelope.Payload, &progress) == nil {
-					ackProgress := func() {
-						if progress.ReceiptID == "" {
-							return
-						}
-						s.hub.SendCommand(sessionID, protocol.ClientCommand{
-							Type: "command", Action: "rope_progress_ack", TeamID: progress.TeamID,
-							CycleID: progress.CycleID, ReceiptID: progress.ReceiptID,
-						})
-					}
-					var result sql.Result
-					var updateErr error
-					switch progress.Event {
-					case "buff_due":
-						_, _ = s.startBossBuffCycle(r.Context(), user.ID, sessionID)
-						ackProgress()
-						continue
-					case "boss_joined":
-						s.markBossJoined(r.Context(), user.ID, sessionID, progress)
-						ackProgress()
-						continue
-					case "buff_completed":
-						s.markBossBuffCompleted(r.Context(), user.ID, sessionID, progress)
-						ackProgress()
-						continue
-					case "boss_kicked":
-						s.markBossKicked(r.Context(), user.ID, sessionID, progress)
-						ackProgress()
-						continue
-					case "boss_cycle_disbanded":
-						result, updateErr = s.db.ExecContext(
-							r.Context(),
-							`UPDATE rope_teams
-							 SET created_in_game = 0, boss_cycle_state = 'idle'
-							 WHERE id = ? AND user_id = ? AND leader_session_id = ?
-							   AND boss_cycle_id = ? AND boss_cycle_state = 'disbanding'`,
-							progress.TeamID, user.ID, sessionID, progress.CycleID,
-						)
-						if updateErr == nil {
-							if affected, _ := result.RowsAffected(); affected > 0 {
-								_, updateErr = s.db.ExecContext(
-									r.Context(),
-									`UPDATE rope_team_members SET invited = 0, joined = 0,
-									        joined_at = NULL, boss_completed_cycle_id = 0
-									 WHERE team_id = ?`, progress.TeamID,
-								)
-							}
-						}
-					}
-					switch progress.Event {
-					case "team_created":
-						result, updateErr = s.db.ExecContext(
-							r.Context(),
-							`UPDATE rope_teams rt
-							 JOIN rope_team_members rtm
-							   ON rtm.team_id = rt.id AND rtm.session_id = rt.leader_session_id
-							 SET rt.created_in_game = 1,
-							     rtm.joined = 1,
-							     rtm.joined_at = NOW(3)
-							 WHERE rt.id = ? AND rt.user_id = ? AND rt.leader_session_id = ?`,
-							progress.TeamID, user.ID, sessionID,
-						)
-					case "invitation_sent":
-						result, updateErr = s.db.ExecContext(
-							r.Context(),
-							`UPDATE rope_team_members rtm
-							 JOIN rope_teams rt ON rt.id = rtm.team_id
-							 JOIN monitor_sessions ms ON ms.id = rtm.session_id
-							 SET rtm.invited = 1
-							 WHERE rtm.team_id = ? AND rt.user_id = ?
-							   AND rt.leader_session_id = ? AND ms.role_name = ?`,
-							progress.TeamID, user.ID, sessionID, progress.RoleName,
-						)
-					case "team_disbanded":
-						var state string
-						_ = s.db.QueryRowContext(r.Context(), `SELECT boss_cycle_state FROM rope_teams WHERE id = ? AND user_id = ?`, progress.TeamID, user.ID).Scan(&state)
-						if state == "changing_leader" {
-							result, updateErr = s.db.ExecContext(r.Context(), `UPDATE rope_teams SET created_in_game = 0, boss_cycle_state = 'idle' WHERE id = ? AND user_id = ? AND leader_session_id <> ?`, progress.TeamID, user.ID, sessionID)
-							if updateErr == nil {
-								s.configureSavedRopeTeam(r.Context(), user.ID, progress.TeamID)
-							}
-						} else {
-							result, updateErr = s.db.ExecContext(r.Context(), `DELETE FROM rope_teams WHERE id = ? AND user_id = ? AND leader_session_id = ?`, progress.TeamID, user.ID, sessionID)
-						}
-					}
-					if updateErr == nil && result != nil {
-						if affected, _ := result.RowsAffected(); affected > 0 {
-							s.hub.NotifyClients(user.ID)
-						}
-					}
-					if updateErr == nil {
-						ackProgress()
-					}
+					s.handleMemoryRopeEvent(r.Context(), user.ID, sessionID, progress)
 				}
+				continue
 			}
 		case command, ok := <-controls:
 			if !ok || command == nil {

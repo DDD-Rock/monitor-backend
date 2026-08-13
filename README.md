@@ -91,7 +91,8 @@ ALLOW_REGISTRATION=true
 - `GET /api/healthz`
 - `GET /ws/device?client_id=...`（客户端设备与控制通道）
 - `GET /ws/clients?access_token=...`（网页客户端管理通道）
-- `GET / PUT / DELETE /api/rope-team`（每个账号唯一的挂绳队伍；删除时通知在线队长退出队伍）
+- `GET / PUT / DELETE /api/rope-team`（进程内挂绳队伍，服务重启后清空）
+- `POST /api/rope-team/restart`（人工触发“重新组队放BUFF”）
 - `GET /ws/view?access_token=...`（账号当前唯一活跃会话的监控通道；客户端变更时自动切换）
 - `GET /api/notifications/bark`
 - `PUT /api/notifications/exp-stalled`

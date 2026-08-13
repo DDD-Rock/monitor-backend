@@ -45,6 +45,7 @@ func TestAccountMonitorRoutesRequireLogin(t *testing.T) {
 		{http.MethodGet, "/api/rope-team", ""},
 		{http.MethodPut, "/api/rope-team", `{"leaderSessionId":"00000000-0000-0000-0000-000000000000","memberSessionIds":[]}`},
 		{http.MethodPut, "/api/rope-team/boss", `{"roleName":"老板"}`},
+		{http.MethodPost, "/api/rope-team/restart", ""},
 		{http.MethodDelete, "/api/rope-team/members/00000000-0000-0000-0000-000000000000", ""},
 		{http.MethodDelete, "/api/rope-team", ""},
 		{http.MethodGet, "/api/admin/users/1/clients", ""},

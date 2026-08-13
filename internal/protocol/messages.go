@@ -303,28 +303,22 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 			return Envelope{}, errors.New("invalid rope party progress payload")
 		}
 		switch payload.Event {
-		case "team_created":
-			if payload.RoleName != "" {
-				return Envelope{}, errors.New("team created progress must not carry role name")
-			}
-		case "team_disbanded":
-			if payload.RoleName != "" {
-				return Envelope{}, errors.New("team disbanded progress must not carry role name")
-			}
-		case "boss_cycle_disbanded":
-			if payload.CycleID <= 0 || payload.RoleName != "" {
-				return Envelope{}, errors.New("invalid boss cycle disbanded progress")
-			}
-		case "buff_due":
+		case "party_commands_finished", "buff_due":
 			if payload.CycleID != 0 || payload.RoleName != "" {
-				return Envelope{}, errors.New("buff due progress must not carry cycle or role name")
+				return Envelope{}, errors.New("invalid rope party event")
 			}
-		case "boss_joined", "buff_completed", "boss_kicked":
+		case "team_joined":
+			if payload.CycleID != 0 || payload.RoleName != "" {
+				return Envelope{}, errors.New("invalid team joined progress")
+			}
+		case "party_rebuild_commands_finished", "boss_joined", "buff_finished":
 			if payload.CycleID <= 0 || payload.RoleName != "" {
-				return Envelope{}, errors.New("invalid boss buff cycle progress")
+				return Envelope{}, errors.New("invalid rope party cycle event")
 			}
-		case "invitation_sent":
-			if len([]rune(payload.RoleName)) == 0 || len([]rune(payload.RoleName)) > 24 {
+		// Legacy events remain parseable during the rolling client upgrade. The
+		// API ignores them instead of touching the removed runtime tables.
+		case "team_created", "team_disbanded", "boss_cycle_disbanded", "buff_completed", "boss_kicked", "invitation_sent":
+			if payload.Event == "invitation_sent" && len([]rune(payload.RoleName)) == 0 {
 				return Envelope{}, errors.New("invalid invited role name")
 			}
 		default:

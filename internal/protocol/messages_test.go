@@ -169,6 +169,10 @@ func TestValidateEnvelopeRejectsInvalidTeamJoined(t *testing.T) {
 
 func TestValidateEnvelopeAcceptsRopePartyProgress(t *testing.T) {
 	for _, message := range []string{
+		`{"type":"rope_party_progress","sequence":1,"payload":{"teamId":7,"event":"party_commands_finished"}}`,
+		`{"type":"rope_party_progress","sequence":2,"payload":{"teamId":7,"event":"team_joined"}}`,
+		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"cycleId":3,"event":"party_rebuild_commands_finished"}}`,
+		`{"type":"rope_party_progress","sequence":4,"payload":{"teamId":7,"cycleId":3,"event":"buff_finished"}}`,
 		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created"}}`,
 		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created","receiptId":"receipt-123"}}`,
 		`{"type":"rope_party_progress","sequence":4,"payload":{"teamId":7,"event":"invitation_sent","roleName":"队员甲"}}`,

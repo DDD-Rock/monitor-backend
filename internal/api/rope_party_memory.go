@@ -231,11 +231,8 @@ func (s *Server) handleRestartMemoryRopeTeam(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusNotFound, "rope_team_not_found", "当前没有挂绳队伍")
 		return
 	}
-	if team.Cycle != nil && team.Cycle.Manual {
-		s.rope.mu.Unlock()
-		writeError(w, http.StatusConflict, "restart_in_progress", "正在重新组队")
-		return
-	}
+	// This is the recovery path. A previous manual cycle may have stalled after
+	// delivery, so every click intentionally supersedes it with a fresh cycle.
 	cycle := &memoryBossCycle{ID: s.rope.nextCycleID.Add(1), State: "rebuilding", Manual: true, RestartBeforeBuff: true, Participants: map[string]bool{}, Completed: map[string]bool{}, StartedAt: time.Now().UnixMilli()}
 	team.Cycle, team.State, team.LastError = cycle, "setting_up", ""
 	for _, member := range team.Members {

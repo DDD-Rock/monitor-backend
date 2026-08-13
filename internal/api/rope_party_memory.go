@@ -333,8 +333,8 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 		if cycle == nil || cycle.ID != progress.CycleID || cycle.State != "inviting" || sessionID != team.LeaderSessionID {
 			break
 		}
-		cycle.State = "casting"
-		for memberID := range cycle.Participants {
+		memberIDs := beginCycleCastingLocked(team, cycle)
+		for _, memberID := range memberIDs {
 			s.hub.SendCommand(memberID, protocol.ClientCommand{Type: "command", Action: "cast_buffs", TeamID: team.ID, CycleID: cycle.ID})
 		}
 		go s.scheduleRopeTimeout(userID, team.ID, cycle.ID, "", "casting", 30*time.Second)
@@ -452,10 +452,29 @@ func allMembersJoined(team *memoryRopeTeam) bool {
 }
 
 func allCycleCompleted(cycle *memoryBossCycle) bool {
+	if len(cycle.Participants) == 0 {
+		return false
+	}
 	for sessionID := range cycle.Participants {
 		if !cycle.Completed[sessionID] {
 			return false
 		}
 	}
 	return true
+}
+
+// beginCycleCastingLocked creates the completion barrier at the moment the
+// boss joins. Every configured team member, including the leader, must report
+// buff_finished before the party may be rebuilt. Offline or stuck clients are
+// handled by the casting timeout instead of being silently excluded.
+func beginCycleCastingLocked(team *memoryRopeTeam, cycle *memoryBossCycle) []string {
+	cycle.State = "casting"
+	cycle.Participants = make(map[string]bool, len(team.Members))
+	cycle.Completed = make(map[string]bool, len(team.Members))
+	memberIDs := make([]string, 0, len(team.Members))
+	for sessionID := range team.Members {
+		cycle.Participants[sessionID] = true
+		memberIDs = append(memberIDs, sessionID)
+	}
+	return memberIDs
 }

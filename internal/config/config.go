@@ -21,7 +21,7 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	ttl, err := time.ParseDuration(valueOrDefault("JWT_TTL", "168h"))
+	ttl, err := time.ParseDuration(valueOrDefault("JWT_TTL", "720h"))
 	if err != nil {
 		return Config{}, fmt.Errorf("JWT_TTL: %w", err)
 	}

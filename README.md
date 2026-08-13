@@ -13,7 +13,7 @@ AutoBuff 远程控制与纯标注监控的 Go 服务端。一个账号可以登�
 
 - `DATABASE_DSN`
 - `JWT_SECRET`
-- `JWT_TTL`（默认 `168h`，即 7 天）
+- `JWT_TTL`（默认 `720h`，即 30 天）
 - `PUBLIC_BASE_URL`
 
 执行仓库内的 `migrations/monitor_schema.sql` 创建 MySQL 数据库表：

@@ -42,6 +42,101 @@ func TestConcurrentBuffDueReportsMergeIntoOneEvent(t *testing.T) {
 	}
 }
 
+func TestInitialPartyInvitesBossAfterEveryMemberJoins(t *testing.T) {
+	hub := realtime.NewHub()
+	defer hub.Close()
+	server := &Server{hub: hub, rope: newRopePartyManager()}
+	team := testRopeTeam(nil)
+	team.State = "setting_up"
+	team.BuffAfterSetup = true
+	team.SetupAttemptID = "initial-setup-attempt"
+	team.Members["leader"].Joined = false
+	server.rope.teams[42] = team
+
+	server.handleMemoryRopeEvent(context.Background(), 42, "leader", protocol.RopePartyProgressPayload{
+		TeamID: 7, Event: "party_commands_finished", MessageID: "message-1",
+	})
+	if team.State != "waiting_members" || !team.Members["leader"].Joined || team.Cycle != nil {
+		t.Fatalf("initial party did not wait for fixed members: %+v", team)
+	}
+
+	server.handleMemoryRopeEvent(context.Background(), 42, "member", protocol.RopePartyProgressPayload{
+		TeamID: 7, Event: "team_joined", MessageID: "message-2",
+	})
+	if team.Cycle == nil || team.Cycle.State != "inviting" || team.Cycle.ID == "" || team.BuffAfterSetup || team.SetupAttemptID != "" || team.State != "ready" {
+		t.Fatalf("initial party did not start its boss BUFF event: %+v", team)
+	}
+}
+
+func TestManualRestartInvitesBossAfterRebuiltMembersJoin(t *testing.T) {
+	hub := realtime.NewHub()
+	defer hub.Close()
+	server := &Server{hub: hub, rope: newRopePartyManager()}
+	cycle := newMemoryBossCycle(true, true, "pre_rebuilding")
+	team := testRopeTeam(cycle)
+	team.State = "setting_up"
+	team.SetupAttemptID = cycle.ID
+	team.Members["leader"].Joined = false
+	server.rope.teams[42] = team
+
+	server.handleMemoryRopeEvent(context.Background(), 42, "leader", protocol.RopePartyProgressPayload{
+		TeamID: 7, EventID: cycle.ID, Event: "rebuild_finished", MessageID: "message-1",
+	})
+	if cycle.State != "waiting_members" || !team.Members["leader"].Joined {
+		t.Fatalf("manual restart did not wait for rebuilt members: %+v", team)
+	}
+
+	server.handleMemoryRopeEvent(context.Background(), 42, "member", protocol.RopePartyProgressPayload{
+		TeamID: 7, EventID: cycle.ID, Event: "team_joined", MessageID: "message-2",
+	})
+	if team.Cycle != cycle || cycle.State != "inviting" || cycle.RestartBeforeBuff || team.SetupAttemptID != "" || team.State != "ready" {
+		t.Fatalf("manual restart did not continue to the boss BUFF event: %+v", team)
+	}
+}
+
+func TestStaleTeamTimeoutCannotFailNewSetupAttempt(t *testing.T) {
+	hub := realtime.NewHub()
+	defer hub.Close()
+	server := &Server{hub: hub, rope: newRopePartyManager()}
+	team := testRopeTeam(nil)
+	team.State = "waiting_members"
+	team.SetupAttemptID = "old-setup-attempt"
+	server.rope.teams[42] = team
+
+	server.scheduleRopeTeamTimeout(42, team.ID, team.SetupAttemptID, "waiting_members", time.Millisecond)
+	server.rope.mu.Lock()
+	team.SetupAttemptID = "new-setup-attempt"
+	server.rope.mu.Unlock()
+	time.Sleep(10 * time.Millisecond)
+
+	server.rope.mu.Lock()
+	state, lastError := team.State, team.LastError
+	server.rope.mu.Unlock()
+	if state != "waiting_members" || lastError != "" {
+		t.Fatalf("stale setup timeout failed the current attempt: state=%s lastError=%q", state, lastError)
+	}
+}
+
+func TestCurrentTeamTimeoutStillFailsMatchingSetupAttempt(t *testing.T) {
+	hub := realtime.NewHub()
+	defer hub.Close()
+	server := &Server{hub: hub, rope: newRopePartyManager()}
+	team := testRopeTeam(nil)
+	team.State = "waiting_members"
+	team.SetupAttemptID = "current-setup-attempt"
+	server.rope.teams[42] = team
+
+	server.scheduleRopeTeamTimeout(42, team.ID, team.SetupAttemptID, "waiting_members", time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+
+	server.rope.mu.Lock()
+	state, lastError := team.State, team.LastError
+	server.rope.mu.Unlock()
+	if state != "error" || lastError == "" {
+		t.Fatalf("current setup timeout did not fail its matching attempt: state=%s lastError=%q", state, lastError)
+	}
+}
+
 func TestDuplicateBossJoinedDoesNotResetDispatchState(t *testing.T) {
 	hub := realtime.NewHub()
 	defer hub.Close()

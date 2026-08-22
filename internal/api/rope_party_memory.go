@@ -68,6 +68,8 @@ type memoryRopeTeam struct {
 	LastError       string                       `json:"lastError"`
 	Members         map[string]*memoryRopeMember `json:"-"`
 	Cycle           *memoryBossCycle             `json:"cycle,omitempty"`
+	BuffAfterSetup  bool                         `json:"-"`
+	SetupAttemptID  string                       `json:"-"`
 	LastEventID     string                       `json:"-"`
 	LastCompletedAt int64                        `json:"-"`
 	UpdatedAt       int64                        `json:"updatedAt"`
@@ -220,7 +222,8 @@ func (s *Server) handleCreateMemoryRopeTeam(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusConflict, "rope_team_exists", "请先解散当前队伍")
 		return
 	}
-	team := &memoryRopeTeam{ID: s.rope.nextTeamID.Add(1), LeaderSessionID: request.LeaderSessionID, BossRoleName: request.BossRoleName, State: "setting_up", Members: members, UpdatedAt: time.Now().UnixMilli()}
+	setupAttemptID := newRopeEventID()
+	team := &memoryRopeTeam{ID: s.rope.nextTeamID.Add(1), LeaderSessionID: request.LeaderSessionID, BossRoleName: request.BossRoleName, State: "setting_up", Members: members, BuffAfterSetup: true, SetupAttemptID: setupAttemptID, UpdatedAt: time.Now().UnixMilli()}
 	s.rope.teams[userID] = team
 	s.rope.mu.Unlock()
 
@@ -235,7 +238,7 @@ func (s *Server) handleCreateMemoryRopeTeam(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	s.hub.NotifyClients(userID)
-	s.scheduleRopeTeamTimeout(userID, team.ID, "setting_up", 30*time.Second)
+	s.scheduleRopeTeamTimeout(userID, team.ID, setupAttemptID, "setting_up", 30*time.Second)
 	writeJSON(w, http.StatusOK, map[string]any{"team": s.ropeTeamView(userID)})
 }
 
@@ -274,7 +277,7 @@ func (s *Server) handleRestartMemoryRopeTeam(w http.ResponseWriter, r *http.Requ
 		s.rope.addTombstoneLocked(team.Cycle.ID)
 	}
 	cycle := newMemoryBossCycle(true, true, "pre_rebuilding")
-	team.Cycle, team.State, team.LastError = cycle, "setting_up", ""
+	team.Cycle, team.State, team.LastError, team.BuffAfterSetup, team.SetupAttemptID = cycle, "setting_up", "", false, cycle.ID
 	for _, member := range team.Members {
 		member.Joined, member.Completed = false, false
 	}
@@ -359,7 +362,7 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 	notifyLeader := false
 	prepareMembers := make([]string, 0)
 	waitingEventID := ""
-	waitingWithoutEvent := false
+	waitingSetupAttemptID := ""
 
 	s.rope.mu.Lock()
 	team := s.rope.teams[userID]
@@ -381,7 +384,7 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 		if sessionID == team.LeaderSessionID && team.State == "setting_up" && cycle == nil {
 			team.Members[sessionID].Joined = true
 			team.State = "waiting_members"
-			go s.scheduleRopeTeamTimeout(userID, team.ID, "waiting_members", 45*time.Second)
+			waitingSetupAttemptID = team.SetupAttemptID
 		}
 	case "team_joined":
 		if progress.EventID == "" || progress.EventID == team.LastEventID || cycle != nil && progress.EventID == cycle.ID {
@@ -438,6 +441,7 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 			cycle.LeaderReadyAcked = true
 			cycle.State = "rebuilding"
 			team.State = "setting_up"
+			team.SetupAttemptID = cycle.ID
 			for memberID, member := range team.Members {
 				member.Joined = false
 				if memberID != team.LeaderSessionID {
@@ -461,12 +465,13 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 			case "rebuilding":
 				team.Members[sessionID].Joined = true
 				team.State = "waiting_members"
+				team.SetupAttemptID = cycle.ID
 				team.LastEventID = cycle.ID
 				team.LastCompletedAt = time.Now().UnixMilli()
 				s.rope.addTombstoneLocked(cycle.ID)
 				team.Cycle = nil
 				cycle = nil
-				waitingWithoutEvent = true
+				waitingSetupAttemptID = team.SetupAttemptID
 			}
 		}
 	default:
@@ -476,9 +481,21 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 		if cycle != nil && cycle.State == "waiting_members" && cycle.RestartBeforeBuff {
 			cycle.RestartBeforeBuff = false
 			cycle.State = "inviting"
+			team.State = "ready"
+			team.SetupAttemptID = ""
 			startInvite = true
 		} else if cycle == nil {
-			team.State = "ready"
+			if team.BuffAfterSetup {
+				team.BuffAfterSetup = false
+				cycle = newMemoryBossCycle(false, false, "inviting")
+				team.Cycle = cycle
+				team.State = "ready"
+				team.SetupAttemptID = ""
+				startInvite = true
+			} else {
+				team.State = "ready"
+				team.SetupAttemptID = ""
+			}
 		}
 	}
 	team.UpdatedAt = time.Now().UnixMilli()
@@ -511,8 +528,8 @@ func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionI
 	if waitingEventID != "" {
 		s.scheduleRopeEventTimeout(userID, teamID, waitingEventID, "waiting_members", 45*time.Second, "等待固定成员重新进队超时")
 	}
-	if waitingWithoutEvent {
-		s.scheduleRopeTeamTimeout(userID, teamID, "waiting_members", 45*time.Second)
+	if waitingSetupAttemptID != "" {
+		s.scheduleRopeTeamTimeout(userID, teamID, waitingSetupAttemptID, "waiting_members", 45*time.Second)
 	}
 	for _, memberID := range prepareMembers {
 		s.hub.SendCommand(memberID, protocol.ClientCommand{Type: "command", Action: "prepare_for_rebuild", TeamID: teamID, EventID: progress.EventID})
@@ -751,7 +768,7 @@ func (s *Server) failMemoryRopeEvent(userID, teamID int64, eventID, message stri
 func (s *Server) failMemoryRopeEventLocked(team *memoryRopeTeam, eventID, message string) {
 	s.rope.addTombstoneLocked(eventID)
 	team.LastEventID, team.LastCompletedAt = eventID, time.Now().UnixMilli()
-	team.Cycle, team.State, team.LastError, team.UpdatedAt = nil, "error", message, time.Now().UnixMilli()
+	team.Cycle, team.State, team.LastError, team.SetupAttemptID, team.UpdatedAt = nil, "error", message, "", time.Now().UnixMilli()
 }
 
 func (s *Server) scheduleRopeEventTimeout(userID, teamID int64, eventID, state string, delay time.Duration, message string) {
@@ -769,14 +786,14 @@ func (s *Server) scheduleRopeEventTimeout(userID, teamID int64, eventID, state s
 	})
 }
 
-func (s *Server) scheduleRopeTeamTimeout(userID, teamID int64, teamState string, delay time.Duration) {
-	if userID <= 0 {
+func (s *Server) scheduleRopeTeamTimeout(userID, teamID int64, setupAttemptID, teamState string, delay time.Duration) {
+	if userID <= 0 || setupAttemptID == "" {
 		return
 	}
 	time.AfterFunc(delay, func() {
 		s.rope.mu.Lock()
 		team := s.rope.teams[userID]
-		if team == nil || team.ID != teamID || team.State != teamState {
+		if team == nil || team.ID != teamID || team.SetupAttemptID != setupAttemptID || team.State != teamState {
 			s.rope.mu.Unlock()
 			return
 		}

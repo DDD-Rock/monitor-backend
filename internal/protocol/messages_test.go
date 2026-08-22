@@ -169,16 +169,20 @@ func TestValidateEnvelopeRejectsInvalidTeamJoined(t *testing.T) {
 
 func TestValidateEnvelopeAcceptsRopePartyProgress(t *testing.T) {
 	for _, message := range []string{
-		`{"type":"rope_party_progress","sequence":1,"payload":{"teamId":7,"event":"party_commands_finished"}}`,
-		`{"type":"rope_party_progress","sequence":2,"payload":{"teamId":7,"event":"team_joined"}}`,
-		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"cycleId":3,"event":"party_rebuild_commands_finished"}}`,
-		`{"type":"rope_party_progress","sequence":4,"payload":{"teamId":7,"cycleId":3,"event":"buff_finished"}}`,
+		`{"type":"rope_party_progress","sequence":1,"payload":{"teamId":7,"event":"party_commands_finished","messageId":"message-123"}}`,
+		`{"type":"rope_party_progress","sequence":2,"payload":{"teamId":7,"event":"team_joined","eventId":"event-123","messageId":"message-124"}}`,
 		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created"}}`,
 		`{"type":"rope_party_progress","sequence":3,"payload":{"teamId":7,"event":"team_created","receiptId":"receipt-123"}}`,
 		`{"type":"rope_party_progress","sequence":4,"payload":{"teamId":7,"event":"invitation_sent","roleName":"队员甲"}}`,
 		`{"type":"rope_party_progress","sequence":5,"payload":{"teamId":7,"event":"team_disbanded"}}`,
-		`{"type":"rope_party_progress","sequence":6,"payload":{"teamId":7,"event":"buff_due"}}`,
-		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"cycleId":3,"event":"boss_joined"}}`,
+		`{"type":"rope_party_progress","sequence":6,"payload":{"teamId":7,"event":"buff_due","messageId":"message-125"}}`,
+		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-126","event":"invite_boss_ack"}}`,
+		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"eventId":"event-123","event":"boss_invite_status","roleName":"invitation_sent"}}`,
+		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-127","event":"boss_joined"}}`,
+		`{"type":"rope_party_progress","sequence":9,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-128","event":"cast_buffs_ack"}}`,
+		`{"type":"rope_party_progress","sequence":10,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-129","event":"buff_finished"}}`,
+		`{"type":"rope_party_progress","sequence":11,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-130","event":"all_buffs_finished_ack"}}`,
+		`{"type":"rope_party_progress","sequence":12,"payload":{"teamId":7,"eventId":"event-123","messageId":"message-131","event":"rebuild_finished"}}`,
 		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"cycleId":3,"event":"buff_completed"}}`,
 		`{"type":"rope_party_progress","sequence":9,"payload":{"teamId":7,"cycleId":3,"event":"boss_kicked"}}`,
 		`{"type":"rope_party_progress","sequence":10,"payload":{"teamId":7,"cycleId":3,"event":"boss_cycle_disbanded"}}`,
@@ -196,6 +200,7 @@ func TestValidateEnvelopeRejectsInvalidRopePartyProgress(t *testing.T) {
 		`{"type":"rope_party_progress","sequence":5,"payload":{"teamId":7,"event":"unknown"}}`,
 		`{"type":"rope_party_progress","sequence":6,"payload":{"teamId":7,"event":"boss_joined"}}`,
 		`{"type":"rope_party_progress","sequence":7,"payload":{"teamId":7,"cycleId":3,"event":"buff_due"}}`,
+		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"eventId":"short","event":"buff_finished"}}`,
 		`{"type":"rope_party_progress","sequence":8,"payload":{"teamId":7,"event":"team_created","receiptId":"short"}}`,
 	} {
 		if _, err := ValidateEnvelope([]byte(message)); err == nil {

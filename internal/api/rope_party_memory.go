@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -14,11 +16,20 @@ import (
 
 var errRopeTeamNotFound = errors.New("rope team not found")
 
+const (
+	ropeCommandAckWindow = 5 * time.Second
+	ropeCastingTimeout   = 45 * time.Second
+	ropeInviteTimeout    = 90 * time.Second
+	ropeRebuildTimeout   = 45 * time.Second
+	ropeEventCooldown    = 20 * time.Second
+	ropeTombstoneTTL     = 5 * time.Minute
+)
+
 type ropePartyManager struct {
-	mu          sync.Mutex
-	teams       map[int64]*memoryRopeTeam
-	nextTeamID  atomic.Int64
-	nextCycleID atomic.Int64
+	mu         sync.Mutex
+	teams      map[int64]*memoryRopeTeam
+	tombstones map[string]time.Time
+	nextTeamID atomic.Int64
 }
 
 type memoryRopeMember struct {
@@ -33,12 +44,19 @@ type memoryRopeMember struct {
 }
 
 type memoryBossCycle struct {
-	ID                int64           `json:"id"`
+	ID                string          `json:"id"`
 	State             string          `json:"state"`
 	Manual            bool            `json:"manual"`
 	RestartBeforeBuff bool            `json:"-"`
 	Participants      map[string]bool `json:"-"`
+	CommandAcked      map[string]bool `json:"-"`
 	Completed         map[string]bool `json:"-"`
+	CommandTimedOut   map[string]bool `json:"-"`
+	CastTimedOut      map[string]bool `json:"-"`
+	InviteAcked       bool            `json:"-"`
+	LeaderReadyAcked  bool            `json:"-"`
+	RebuildAcked      bool            `json:"-"`
+	InviteStatus      string          `json:"inviteStatus,omitempty"`
 	StartedAt         int64           `json:"startedAt"`
 }
 
@@ -50,6 +68,8 @@ type memoryRopeTeam struct {
 	LastError       string                       `json:"lastError"`
 	Members         map[string]*memoryRopeMember `json:"-"`
 	Cycle           *memoryBossCycle             `json:"cycle,omitempty"`
+	LastEventID     string                       `json:"-"`
+	LastCompletedAt int64                        `json:"-"`
 	UpdatedAt       int64                        `json:"updatedAt"`
 }
 
@@ -65,9 +85,8 @@ type memoryRopeTeamView struct {
 }
 
 func newRopePartyManager() *ropePartyManager {
-	m := &ropePartyManager{teams: make(map[int64]*memoryRopeTeam)}
+	m := &ropePartyManager{teams: make(map[int64]*memoryRopeTeam), tombstones: make(map[string]time.Time)}
 	m.nextTeamID.Store(time.Now().UnixMilli())
-	m.nextCycleID.Store(time.Now().UnixMilli())
 	return m
 }
 
@@ -78,7 +97,16 @@ func (m *ropePartyManager) view(userID int64, online func(string) bool) *memoryR
 	if team == nil {
 		return nil
 	}
-	view := &memoryRopeTeamView{ID: team.ID, LeaderSessionID: team.LeaderSessionID, BossRoleName: team.BossRoleName, State: team.State, LastError: team.LastError, Cycle: team.Cycle, UpdatedAt: team.UpdatedAt}
+	view := &memoryRopeTeamView{ID: team.ID, LeaderSessionID: team.LeaderSessionID, BossRoleName: team.BossRoleName, State: team.State, LastError: team.LastError, UpdatedAt: team.UpdatedAt}
+	if team.Cycle != nil {
+		cycle := *team.Cycle
+		cycle.Participants = cloneBoolMap(team.Cycle.Participants)
+		cycle.CommandAcked = cloneBoolMap(team.Cycle.CommandAcked)
+		cycle.Completed = cloneBoolMap(team.Cycle.Completed)
+		cycle.CommandTimedOut = cloneBoolMap(team.Cycle.CommandTimedOut)
+		cycle.CastTimedOut = cloneBoolMap(team.Cycle.CastTimedOut)
+		view.Cycle = &cycle
+	}
 	for _, member := range team.Members {
 		copy := *member
 		copy.Online = online(member.SessionID)
@@ -88,6 +116,14 @@ func (m *ropePartyManager) view(userID int64, online func(string) bool) *memoryR
 		view.Members = append(view.Members, &copy)
 	}
 	return view
+}
+
+func cloneBoolMap(source map[string]bool) map[string]bool {
+	result := make(map[string]bool, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func (s *Server) ropeTeamView(userID int64) *memoryRopeTeamView {
@@ -199,7 +235,7 @@ func (s *Server) handleCreateMemoryRopeTeam(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	s.hub.NotifyClients(userID)
-	s.scheduleRopeTimeout(userID, team.ID, 0, "setting_up", "", 30*time.Second)
+	s.scheduleRopeTeamTimeout(userID, team.ID, "setting_up", 30*time.Second)
 	writeJSON(w, http.StatusOK, map[string]any{"team": s.ropeTeamView(userID)})
 }
 
@@ -231,30 +267,41 @@ func (s *Server) handleRestartMemoryRopeTeam(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusNotFound, "rope_team_not_found", "当前没有挂绳队伍")
 		return
 	}
-	// This is the recovery path. A previous manual cycle may have stalled after
-	// delivery, so every click intentionally supersedes it with a fresh cycle.
-	cycle := &memoryBossCycle{ID: s.rope.nextCycleID.Add(1), State: "rebuilding", Manual: true, RestartBeforeBuff: true, Participants: map[string]bool{}, Completed: map[string]bool{}, StartedAt: time.Now().UnixMilli()}
+	// Recovery deliberately supersedes a stalled event with a fresh UUID. Late
+	// messages from the old event are acknowledged through the tombstone map but
+	// can no longer advance this team.
+	if team.Cycle != nil {
+		s.rope.addTombstoneLocked(team.Cycle.ID)
+	}
+	cycle := newMemoryBossCycle(true, true, "pre_rebuilding")
 	team.Cycle, team.State, team.LastError = cycle, "setting_up", ""
 	for _, member := range team.Members {
 		member.Joined, member.Completed = false, false
 	}
 	leaderID, teamID, bossName, invites := team.LeaderSessionID, team.ID, team.BossRoleName, memberRoleNames(team, false)
+	prepareMemberIDs := make([]string, 0, len(team.Members))
+	for sessionID := range team.Members {
+		if sessionID != leaderID {
+			prepareMemberIDs = append(prepareMemberIDs, sessionID)
+		}
+	}
 	s.rope.mu.Unlock()
 	if online, _, _ := s.hub.ClientStatus(leaderID); !online {
 		s.failMemoryRopeTeam(userID, "队长离线，无法重新组队")
 		writeError(w, http.StatusConflict, "leader_offline", "队长离线")
 		return
 	}
-	for sessionID := range team.Members {
-		if sessionID != leaderID {
-			s.hub.SendCommand(sessionID, protocol.ClientCommand{Type: "command", Action: "prepare_for_rebuild", TeamID: teamID, CycleID: cycle.ID})
-		}
+	for _, sessionID := range prepareMemberIDs {
+		s.hub.SendCommand(sessionID, protocol.ClientCommand{Type: "command", Action: "prepare_for_rebuild", TeamID: teamID, EventID: cycle.ID})
 	}
-	if !s.hub.SendCommand(leaderID, protocol.ClientCommand{Type: "command", Action: "restart_party_and_buff", TeamID: teamID, CycleID: cycle.ID, TargetRoleName: bossName, InviteRoleNames: invites}) {
+	if !s.hub.SendCommand(leaderID, protocol.ClientCommand{Type: "command", Action: "restart_party_and_buff", TeamID: teamID, EventID: cycle.ID, TargetRoleName: bossName, InviteRoleNames: invites}) {
 		s.failMemoryRopeTeam(userID, "队长无法接收重新组队命令")
 	}
 	s.hub.NotifyClients(userID)
-	s.scheduleRopeTimeout(userID, teamID, cycle.ID, "setting_up", "rebuilding", 30*time.Second)
+	go s.retryRopeCommand(userID, teamID, cycle.ID, leaderID, "restart_party_and_buff", ropeRebuildTimeout, func(cycle *memoryBossCycle) bool {
+		return cycle.State != "pre_rebuilding" || cycle.RebuildAcked
+	}, protocol.ClientCommand{Type: "command", Action: "restart_party_and_buff", TeamID: teamID, EventID: cycle.ID, TargetRoleName: bossName, InviteRoleNames: invites})
+	s.scheduleRopeEventTimeout(userID, teamID, cycle.ID, "pre_rebuilding", ropeRebuildTimeout, "队长重新组队超时")
 	writeJSON(w, http.StatusAccepted, map[string]any{"team": s.ropeTeamView(userID)})
 }
 
@@ -305,136 +352,436 @@ func (s *Server) handleRemoveMemoryRopeMember(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleMemoryRopeEvent(_ context.Context, userID int64, sessionID string, progress protocol.RopePartyProgressPayload) {
+	ackEventID := progress.EventID
+	startInvite := false
+	dispatchBuffs := false
+	finalizeParticipants := false
+	notifyLeader := false
+	prepareMembers := make([]string, 0)
+	waitingEventID := ""
+	waitingWithoutEvent := false
+
 	s.rope.mu.Lock()
 	team := s.rope.teams[userID]
 	if team == nil || team.ID != progress.TeamID {
 		s.rope.mu.Unlock()
+		s.sendRopeEventAck(sessionID, progress, ackEventID)
+		return
+	}
+	lateRebuildJoin := progress.Event == "team_joined" && team.State == "waiting_members" && progress.EventID == team.LastEventID
+	if progress.EventID != "" && s.rope.hasTombstoneLocked(progress.EventID) && !lateRebuildJoin {
+		s.rope.mu.Unlock()
+		s.sendRopeEventAck(sessionID, progress, progress.EventID)
 		return
 	}
 	cycle := team.Cycle
 	notify := true
 	switch progress.Event {
 	case "party_commands_finished":
-		if sessionID != team.LeaderSessionID || team.State != "setting_up" {
-			break
+		if sessionID == team.LeaderSessionID && team.State == "setting_up" && cycle == nil {
+			team.Members[sessionID].Joined = true
+			team.State = "waiting_members"
+			go s.scheduleRopeTeamTimeout(userID, team.ID, "waiting_members", 45*time.Second)
 		}
-		team.Members[sessionID].Joined = true
-		team.State = "waiting_members"
-		go s.scheduleRopeTimeout(userID, team.ID, 0, "waiting_members", "", 45*time.Second)
 	case "team_joined":
-		if member := team.Members[sessionID]; member != nil {
-			member.Joined = true
+		if progress.EventID == "" || progress.EventID == team.LastEventID || cycle != nil && progress.EventID == cycle.ID {
+			if member := team.Members[sessionID]; member != nil {
+				member.Joined = true
+			}
 		}
 	case "buff_due":
-		if team.State == "ready" && cycle == nil && allMembersJoined(team) {
-			cycle = s.newMemoryBossCycleLocked(team, false)
+		if cycle != nil {
+			ackEventID = cycle.ID
+		} else if team.State == "ready" && allMembersJoined(team) &&
+			time.Now().UnixMilli()-team.LastCompletedAt >= ropeEventCooldown.Milliseconds() {
+			cycle = newMemoryBossCycle(false, false, "inviting")
+			team.Cycle = cycle
+			ackEventID = cycle.ID
+			startInvite = true
+		}
+	case "invite_boss_ack":
+		if validRopeEvent(team, progress.EventID, "inviting") && sessionID == team.LeaderSessionID {
+			cycle.InviteAcked = true
+		}
+	case "boss_invite_status":
+		// Best-effort UI telemetry only. It never advances the event.
+		notify = validRopeEvent(team, progress.EventID, "inviting")
+		if notify {
+			cycle.InviteStatus = progress.RoleName
 		}
 	case "boss_joined":
-		if cycle == nil || cycle.ID != progress.CycleID || cycle.State != "inviting" || sessionID != team.LeaderSessionID {
-			break
+		if validRopeEvent(team, progress.EventID, "inviting") && sessionID == team.LeaderSessionID {
+			cycle.State = "dispatching_buffs"
+			cycle.CommandAcked = make(map[string]bool, len(team.Members))
+			cycle.Participants = make(map[string]bool, len(team.Members))
+			cycle.Completed = make(map[string]bool, len(team.Members))
+			cycle.CommandTimedOut = make(map[string]bool)
+			cycle.CastTimedOut = make(map[string]bool)
+			dispatchBuffs = true
 		}
-		memberIDs := beginCycleCastingLocked(team, cycle)
-		for _, memberID := range memberIDs {
-			s.hub.SendCommand(memberID, protocol.ClientCommand{Type: "command", Action: "cast_buffs", TeamID: team.ID, CycleID: cycle.ID})
-		}
-		go s.scheduleRopeTimeout(userID, team.ID, cycle.ID, "", "casting", 30*time.Second)
-	case "buff_finished":
-		if cycle == nil || cycle.ID != progress.CycleID || cycle.State != "casting" || !cycle.Participants[sessionID] {
-			break
-		}
-		cycle.Completed[sessionID] = true
-		if allCycleCompleted(cycle) {
-			cycle.State = "rebuilding"
-			for _, member := range team.Members {
-				member.Joined = false
+	case "cast_buffs_ack":
+		if validRopeEventState(team, progress.EventID, "dispatching_buffs", "casting") && team.Members[sessionID] != nil {
+			cycle.CommandAcked[sessionID] = true
+			if cycle.State == "dispatching_buffs" && allMembersAcknowledged(team, cycle) {
+				finalizeParticipants = true
 			}
-			s.hub.SendCommand(team.LeaderSessionID, protocol.ClientCommand{Type: "command", Action: "rebuild_party", TeamID: team.ID, CycleID: cycle.ID, InviteRoleNames: memberRoleNames(team, false)})
-			go s.scheduleRopeTimeout(userID, team.ID, cycle.ID, "", "rebuilding", 30*time.Second)
 		}
-	case "party_rebuild_commands_finished":
-		if cycle == nil || cycle.ID != progress.CycleID || cycle.State != "rebuilding" || sessionID != team.LeaderSessionID {
-			break
+	case "buff_finished":
+		if validRopeEventState(team, progress.EventID, "dispatching_buffs", "casting") && team.Members[sessionID] != nil {
+			cycle.Completed[sessionID] = true
+			if cycle.State == "casting" && cycle.Participants[sessionID] && allCycleCompleted(cycle) {
+				notifyLeader = true
+			}
 		}
-		team.Members[sessionID].Joined = true
-		team.State, cycle.State = "waiting_members", "waiting_members"
-		go s.scheduleRopeTimeout(userID, team.ID, cycle.ID, "waiting_members", "waiting_members", 45*time.Second)
+	case "all_buffs_finished_ack":
+		if validRopeEvent(team, progress.EventID, "notifying_leader") && sessionID == team.LeaderSessionID {
+			cycle.LeaderReadyAcked = true
+			cycle.State = "rebuilding"
+			team.State = "setting_up"
+			for memberID, member := range team.Members {
+				member.Joined = false
+				if memberID != team.LeaderSessionID {
+					prepareMembers = append(prepareMembers, memberID)
+				}
+			}
+			go s.scheduleRopeEventTimeout(userID, team.ID, cycle.ID, "rebuilding", ropeRebuildTimeout, "队长重建队伍超时")
+		}
+	case "rebuild_command_ack":
+		if validRopeEvent(team, progress.EventID, "pre_rebuilding") && sessionID == team.LeaderSessionID {
+			cycle.RebuildAcked = true
+		}
+	case "rebuild_finished":
+		if cycle != nil && cycle.ID == progress.EventID && sessionID == team.LeaderSessionID {
+			switch cycle.State {
+			case "pre_rebuilding":
+				cycle.State = "waiting_members"
+				team.State = "waiting_members"
+				team.Members[sessionID].Joined = true
+				waitingEventID = cycle.ID
+			case "rebuilding":
+				team.Members[sessionID].Joined = true
+				team.State = "waiting_members"
+				team.LastEventID = cycle.ID
+				team.LastCompletedAt = time.Now().UnixMilli()
+				s.rope.addTombstoneLocked(cycle.ID)
+				team.Cycle = nil
+				cycle = nil
+				waitingWithoutEvent = true
+			}
+		}
 	default:
 		notify = false
 	}
 	if allMembersJoined(team) && team.State == "waiting_members" {
-		if cycle == nil {
-			cycle = s.newMemoryBossCycleLocked(team, false)
-		} else if cycle.RestartBeforeBuff {
-			cycle.RestartBeforeBuff, cycle.State = false, "inviting"
-			s.sendInviteBossLocked(team, cycle)
-		} else if cycle.State == "waiting_members" {
-			team.Cycle, team.State = nil, "ready"
+		if cycle != nil && cycle.State == "waiting_members" && cycle.RestartBeforeBuff {
+			cycle.RestartBeforeBuff = false
+			cycle.State = "inviting"
+			startInvite = true
+		} else if cycle == nil {
+			team.State = "ready"
 		}
 	}
 	team.UpdatedAt = time.Now().UnixMilli()
+	teamID := team.ID
+	leaderID := team.LeaderSessionID
+	eventID := ""
+	if cycle != nil {
+		eventID = cycle.ID
+	}
+	bossName := team.BossRoleName
+	memberIDs := make([]string, 0, len(team.Members))
+	for memberID := range team.Members {
+		memberIDs = append(memberIDs, memberID)
+	}
 	s.rope.mu.Unlock()
+
+	s.sendRopeEventAck(sessionID, progress, ackEventID)
+	if startInvite {
+		s.startInviteBoss(userID, teamID, eventID, leaderID, bossName)
+	}
+	if dispatchBuffs {
+		s.dispatchBuffCommands(userID, teamID, eventID, memberIDs)
+	}
+	if finalizeParticipants {
+		s.finalizeCastParticipants(userID, teamID, eventID)
+	}
+	if notifyLeader {
+		s.beginNotifyLeader(userID, teamID, eventID, false)
+	}
+	if waitingEventID != "" {
+		s.scheduleRopeEventTimeout(userID, teamID, waitingEventID, "waiting_members", 45*time.Second, "等待固定成员重新进队超时")
+	}
+	if waitingWithoutEvent {
+		s.scheduleRopeTeamTimeout(userID, teamID, "waiting_members", 45*time.Second)
+	}
+	for _, memberID := range prepareMembers {
+		s.hub.SendCommand(memberID, protocol.ClientCommand{Type: "command", Action: "prepare_for_rebuild", TeamID: teamID, EventID: progress.EventID})
+	}
 	if notify {
 		s.hub.NotifyClients(userID)
 	}
 }
 
-func (s *Server) newMemoryBossCycleLocked(team *memoryRopeTeam, manual bool) *memoryBossCycle {
-	cycle := &memoryBossCycle{ID: s.rope.nextCycleID.Add(1), State: "inviting", Manual: manual, Participants: map[string]bool{}, Completed: map[string]bool{}, StartedAt: time.Now().UnixMilli()}
-	for sessionID, member := range team.Members {
-		online, _, _ := s.hub.ClientStatus(sessionID)
-		if online && member.Joined {
-			cycle.Participants[sessionID] = true
+func newMemoryBossCycle(manual, restartBeforeBuff bool, state string) *memoryBossCycle {
+	return &memoryBossCycle{
+		ID: newRopeEventID(), State: state, Manual: manual, RestartBeforeBuff: restartBeforeBuff,
+		Participants: map[string]bool{}, CommandAcked: map[string]bool{}, Completed: map[string]bool{},
+		CommandTimedOut: map[string]bool{}, CastTimedOut: map[string]bool{}, StartedAt: time.Now().UnixMilli(),
+	}
+}
+
+func newRopeEventID() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return hex.EncodeToString([]byte(time.Now().Format("20060102150405.000000000")))
+	}
+	bytes[6] = bytes[6]&0x0f | 0x40
+	bytes[8] = bytes[8]&0x3f | 0x80
+	raw := hex.EncodeToString(bytes)
+	return raw[0:8] + "-" + raw[8:12] + "-" + raw[12:16] + "-" + raw[16:20] + "-" + raw[20:]
+}
+
+func (m *ropePartyManager) addTombstoneLocked(eventID string) {
+	if eventID == "" {
+		return
+	}
+	now := time.Now()
+	for id, expiresAt := range m.tombstones {
+		if !expiresAt.After(now) {
+			delete(m.tombstones, id)
 		}
 	}
-	team.Cycle = cycle
-	s.sendInviteBossLocked(team, cycle)
-	return cycle
+	m.tombstones[eventID] = now.Add(ropeTombstoneTTL)
 }
 
-func (s *Server) sendInviteBossLocked(team *memoryRopeTeam, cycle *memoryBossCycle) {
-	s.hub.SendCommand(team.LeaderSessionID, protocol.ClientCommand{Type: "command", Action: "invite_boss", TeamID: team.ID, CycleID: cycle.ID, TargetRoleName: team.BossRoleName})
-	go s.scheduleRopeTimeout(teamUserID(s.rope, team), team.ID, cycle.ID, "", "inviting", 30*time.Second)
+func (m *ropePartyManager) hasTombstoneLocked(eventID string) bool {
+	expiresAt, ok := m.tombstones[eventID]
+	if ok && !expiresAt.After(time.Now()) {
+		delete(m.tombstones, eventID)
+		return false
+	}
+	return ok
 }
 
-// teamUserID is only called while the manager lock is held.
-func teamUserID(manager *ropePartyManager, target *memoryRopeTeam) int64 {
-	for userID, team := range manager.teams {
-		if team == target {
-			return userID
+func validRopeEvent(team *memoryRopeTeam, eventID, state string) bool {
+	return team.Cycle != nil && team.Cycle.ID == eventID && team.Cycle.State == state
+}
+
+func validRopeEventState(team *memoryRopeTeam, eventID string, states ...string) bool {
+	if team.Cycle == nil || team.Cycle.ID != eventID {
+		return false
+	}
+	for _, state := range states {
+		if team.Cycle.State == state {
+			return true
 		}
 	}
-	return 0
+	return false
 }
 
-func (s *Server) scheduleRopeTimeout(userID, teamID, cycleID int64, teamState, cycleState string, delay time.Duration) {
+func (s *Server) sendRopeEventAck(sessionID string, progress protocol.RopePartyProgressPayload, eventID string) {
+	if progress.MessageID == "" {
+		return
+	}
+	s.hub.SendCommand(sessionID, protocol.ClientCommand{
+		Type: "command", Action: "rope_event_ack", TeamID: progress.TeamID,
+		EventID: eventID, Event: progress.Event, MessageID: progress.MessageID,
+	})
+}
+
+func (s *Server) startInviteBoss(userID, teamID int64, eventID, leaderID, bossName string) {
+	command := protocol.ClientCommand{Type: "command", Action: "invite_boss", TeamID: teamID, EventID: eventID, TargetRoleName: bossName}
+	s.hub.SendCommand(leaderID, command)
+	s.scheduleRopeEventTimeout(userID, teamID, eventID, "inviting", ropeInviteTimeout, "等待老板进队超时")
+	go s.retryRopeCommand(userID, teamID, eventID, leaderID, "invite_boss", ropeInviteTimeout, func(cycle *memoryBossCycle) bool {
+		return cycle.State != "inviting" || cycle.InviteAcked
+	}, command)
+}
+
+func (s *Server) dispatchBuffCommands(userID, teamID int64, eventID string, memberIDs []string) {
+	command := protocol.ClientCommand{Type: "command", Action: "cast_buffs", TeamID: teamID, EventID: eventID}
+	for _, memberID := range memberIDs {
+		s.hub.SendCommand(memberID, command)
+	}
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		deadline := time.NewTimer(ropeCommandAckWindow)
+		defer deadline.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.rope.mu.Lock()
+				team := s.rope.teams[userID]
+				if team == nil || team.ID != teamID || !validRopeEvent(team, eventID, "dispatching_buffs") {
+					s.rope.mu.Unlock()
+					return
+				}
+				pending := make([]string, 0)
+				for memberID := range team.Members {
+					if !team.Cycle.CommandAcked[memberID] {
+						pending = append(pending, memberID)
+					}
+				}
+				s.rope.mu.Unlock()
+				for _, memberID := range pending {
+					s.hub.SendCommand(memberID, command)
+				}
+			case <-deadline.C:
+				s.finalizeCastParticipants(userID, teamID, eventID)
+				return
+			}
+		}
+	}()
+}
+
+func (s *Server) finalizeCastParticipants(userID, teamID int64, eventID string) {
+	s.rope.mu.Lock()
+	team := s.rope.teams[userID]
+	if team == nil || team.ID != teamID || !validRopeEvent(team, eventID, "dispatching_buffs") {
+		s.rope.mu.Unlock()
+		return
+	}
+	cycle := team.Cycle
+	for memberID := range team.Members {
+		if cycle.CommandAcked[memberID] {
+			cycle.Participants[memberID] = true
+		} else {
+			cycle.CommandTimedOut[memberID] = true
+		}
+	}
+	if !cycle.Participants[team.LeaderSessionID] {
+		team.State, team.LastError = "error", "队长未确认放 BUFF 指令，本轮已结束"
+		s.rope.addTombstoneLocked(cycle.ID)
+		team.LastEventID, team.LastCompletedAt, team.Cycle = cycle.ID, time.Now().UnixMilli(), nil
+		team.UpdatedAt = time.Now().UnixMilli()
+		s.rope.mu.Unlock()
+		s.hub.NotifyClients(userID)
+		return
+	}
+	cycle.State = "casting"
+	complete := allCycleCompleted(cycle)
+	team.UpdatedAt = time.Now().UnixMilli()
+	s.rope.mu.Unlock()
+	s.hub.NotifyClients(userID)
+	if complete {
+		s.beginNotifyLeader(userID, teamID, eventID, false)
+		return
+	}
+	go func() {
+		time.Sleep(ropeCastingTimeout)
+		s.beginNotifyLeader(userID, teamID, eventID, true)
+	}()
+}
+
+func (s *Server) beginNotifyLeader(userID, teamID int64, eventID string, force bool) {
+	s.rope.mu.Lock()
+	team := s.rope.teams[userID]
+	if team == nil || team.ID != teamID || !validRopeEvent(team, eventID, "casting") {
+		s.rope.mu.Unlock()
+		return
+	}
+	cycle := team.Cycle
+	if !force && !allCycleCompleted(cycle) {
+		s.rope.mu.Unlock()
+		return
+	}
+	if force {
+		for memberID := range cycle.Participants {
+			if !cycle.Completed[memberID] {
+				cycle.CastTimedOut[memberID] = true
+			}
+		}
+	}
+	cycle.State = "notifying_leader"
+	leaderID := team.LeaderSessionID
+	invites := memberRoleNames(team, false)
+	team.UpdatedAt = time.Now().UnixMilli()
+	s.rope.mu.Unlock()
+	command := protocol.ClientCommand{Type: "command", Action: "all_buffs_finished", TeamID: teamID, EventID: eventID, InviteRoleNames: invites}
+	s.hub.SendCommand(leaderID, command)
+	go s.retryRopeCommand(userID, teamID, eventID, leaderID, "all_buffs_finished", ropeRebuildTimeout, func(cycle *memoryBossCycle) bool {
+		return cycle.State != "notifying_leader" || cycle.LeaderReadyAcked
+	}, command)
+	s.hub.NotifyClients(userID)
+}
+
+func (s *Server) retryRopeCommand(userID, teamID int64, eventID, sessionID, action string, timeout time.Duration, done func(*memoryBossCycle) bool, command protocol.ClientCommand) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.rope.mu.Lock()
+			team := s.rope.teams[userID]
+			finished := team == nil || team.ID != teamID || team.Cycle == nil || team.Cycle.ID != eventID || done(team.Cycle)
+			s.rope.mu.Unlock()
+			if finished {
+				return
+			}
+			s.hub.SendCommand(sessionID, command)
+		case <-deadline.C:
+			s.rope.mu.Lock()
+			team := s.rope.teams[userID]
+			timedOut := team != nil && team.ID == teamID && team.Cycle != nil && team.Cycle.ID == eventID && !done(team.Cycle)
+			if timedOut {
+				s.failMemoryRopeEventLocked(team, eventID, action+" 超时")
+			}
+			s.rope.mu.Unlock()
+			if timedOut {
+				s.hub.NotifyClients(userID)
+			}
+			return
+		}
+	}
+}
+
+func (s *Server) failMemoryRopeEvent(userID, teamID int64, eventID, message string) {
+	s.rope.mu.Lock()
+	team := s.rope.teams[userID]
+	if team != nil && team.ID == teamID && team.Cycle != nil && team.Cycle.ID == eventID {
+		s.failMemoryRopeEventLocked(team, eventID, message)
+	}
+	s.rope.mu.Unlock()
+	s.hub.NotifyClients(userID)
+}
+
+func (s *Server) failMemoryRopeEventLocked(team *memoryRopeTeam, eventID, message string) {
+	s.rope.addTombstoneLocked(eventID)
+	team.LastEventID, team.LastCompletedAt = eventID, time.Now().UnixMilli()
+	team.Cycle, team.State, team.LastError, team.UpdatedAt = nil, "error", message, time.Now().UnixMilli()
+}
+
+func (s *Server) scheduleRopeEventTimeout(userID, teamID int64, eventID, state string, delay time.Duration, message string) {
+	time.AfterFunc(delay, func() {
+		s.rope.mu.Lock()
+		team := s.rope.teams[userID]
+		matches := team != nil && team.ID == teamID && validRopeEvent(team, eventID, state)
+		if matches {
+			s.failMemoryRopeEventLocked(team, eventID, message)
+		}
+		s.rope.mu.Unlock()
+		if matches {
+			s.hub.NotifyClients(userID)
+		}
+	})
+}
+
+func (s *Server) scheduleRopeTeamTimeout(userID, teamID int64, teamState string, delay time.Duration) {
 	if userID <= 0 {
 		return
 	}
 	time.AfterFunc(delay, func() {
 		s.rope.mu.Lock()
 		team := s.rope.teams[userID]
-		if team == nil || team.ID != teamID || (teamState != "" && team.State != teamState) {
+		if team == nil || team.ID != teamID || team.State != teamState {
 			s.rope.mu.Unlock()
 			return
 		}
-		if cycleState != "" && (team.Cycle == nil || team.Cycle.ID != cycleID || team.Cycle.State != cycleState) {
-			s.rope.mu.Unlock()
-			return
-		}
-		if cycleState == "casting" && team.Cycle != nil {
-			team.Cycle.State = "rebuilding"
-			for _, member := range team.Members {
-				member.Joined = false
-			}
-			leaderID, command := team.LeaderSessionID, protocol.ClientCommand{Type: "command", Action: "rebuild_party", TeamID: team.ID, CycleID: team.Cycle.ID, InviteRoleNames: memberRoleNames(team, false)}
-			team.LastError, team.UpdatedAt = "部分客户端放 BUFF 超时，已继续重建队伍", time.Now().UnixMilli()
-			s.rope.mu.Unlock()
-			s.hub.SendCommand(leaderID, command)
-			s.scheduleRopeTimeout(userID, teamID, cycleID, "", "rebuilding", 30*time.Second)
-		} else {
-			team.State, team.LastError, team.UpdatedAt = "error", "挂绳组队阶段超时，请点击重新组队放BUFF", time.Now().UnixMilli()
-			s.rope.mu.Unlock()
-		}
+		team.State, team.LastError, team.UpdatedAt = "error", "挂绳组队阶段超时，请点击重新组队放BUFF", time.Now().UnixMilli()
+		s.rope.mu.Unlock()
 		s.hub.NotifyClients(userID)
 	})
 }
@@ -463,18 +810,11 @@ func allCycleCompleted(cycle *memoryBossCycle) bool {
 	return true
 }
 
-// beginCycleCastingLocked creates the completion barrier at the moment the
-// boss joins. Every configured team member, including the leader, must report
-// buff_finished before the party may be rebuilt. Offline or stuck clients are
-// handled by the casting timeout instead of being silently excluded.
-func beginCycleCastingLocked(team *memoryRopeTeam, cycle *memoryBossCycle) []string {
-	cycle.State = "casting"
-	cycle.Participants = make(map[string]bool, len(team.Members))
-	cycle.Completed = make(map[string]bool, len(team.Members))
-	memberIDs := make([]string, 0, len(team.Members))
+func allMembersAcknowledged(team *memoryRopeTeam, cycle *memoryBossCycle) bool {
 	for sessionID := range team.Members {
-		cycle.Participants[sessionID] = true
-		memberIDs = append(memberIDs, sessionID)
+		if !cycle.CommandAcked[sessionID] {
+			return false
+		}
 	}
-	return memberIDs
+	return len(team.Members) > 0
 }

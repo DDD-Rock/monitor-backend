@@ -80,6 +80,9 @@ type ClientCommand struct {
 	Action          string   `json:"action"`
 	Reason          string   `json:"reason,omitempty"`
 	TeamID          int64    `json:"teamId,omitempty"`
+	EventID         string   `json:"eventId,omitempty"`
+	Event           string   `json:"event,omitempty"`
+	MessageID       string   `json:"messageId,omitempty"`
 	IsLeader        bool     `json:"isLeader,omitempty"`
 	FirstCreation   bool     `json:"firstCreation,omitempty"`
 	RoleName        string   `json:"roleName,omitempty"`
@@ -98,6 +101,8 @@ type TeamJoinedPayload struct {
 type RopePartyProgressPayload struct {
 	TeamID    int64  `json:"teamId"`
 	CycleID   int64  `json:"cycleId,omitempty"`
+	EventID   string `json:"eventId,omitempty"`
+	MessageID string `json:"messageId,omitempty"`
 	Event     string `json:"event"`
 	RoleName  string `json:"roleName,omitempty"`
 	ReceiptID string `json:"receiptId,omitempty"`
@@ -299,21 +304,24 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 	case TypeRopeProgress:
 		var payload RopePartyProgressPayload
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.TeamID <= 0 ||
-			(len(payload.ReceiptID) > 0 && (len(payload.ReceiptID) < 8 || len(payload.ReceiptID) > 64)) {
+			(len(payload.ReceiptID) > 0 && (len(payload.ReceiptID) < 8 || len(payload.ReceiptID) > 64)) ||
+			(len(payload.EventID) > 0 && (len(payload.EventID) < 8 || len(payload.EventID) > 64)) ||
+			(len(payload.MessageID) > 0 && (len(payload.MessageID) < 8 || len(payload.MessageID) > 64)) {
 			return Envelope{}, errors.New("invalid rope party progress payload")
 		}
 		switch payload.Event {
-		case "party_commands_finished", "buff_due":
-			if payload.CycleID != 0 || payload.RoleName != "" {
+		case "party_commands_finished", "team_joined", "buff_due":
+			if payload.CycleID != 0 || payload.RoleName != "" || payload.EventID != "" && payload.Event == "buff_due" {
 				return Envelope{}, errors.New("invalid rope party event")
 			}
-		case "team_joined":
-			if payload.CycleID != 0 || payload.RoleName != "" {
-				return Envelope{}, errors.New("invalid team joined progress")
-			}
-		case "party_rebuild_commands_finished", "boss_joined", "buff_finished":
-			if payload.CycleID <= 0 || payload.RoleName != "" {
+		case "invite_boss_ack", "boss_joined", "cast_buffs_ack", "buff_finished",
+			"all_buffs_finished_ack", "rebuild_command_ack", "rebuild_finished":
+			if payload.EventID == "" || payload.CycleID != 0 || payload.RoleName != "" {
 				return Envelope{}, errors.New("invalid rope party cycle event")
+			}
+		case "boss_invite_status":
+			if payload.EventID == "" || payload.CycleID != 0 {
+				return Envelope{}, errors.New("invalid boss invite status")
 			}
 		// Legacy events remain parseable during the rolling client upgrade. The
 		// API ignores them instead of touching the removed runtime tables.

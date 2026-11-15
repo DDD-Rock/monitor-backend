@@ -30,6 +30,7 @@ mysql -u root -p < migrations/monitor_schema.sql
 ```bash
 mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
 mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration.sql
+mysql -u root -p autobuff_monitor < migrations/user_emulator_mode_authorization_migration.sql
 ```
 
 超级管理员只能直接在数据库中授予：
@@ -81,6 +82,7 @@ ALLOW_REGISTRATION=true
 - `PUT /api/admin/users/{id}/password`（超级管理员）
 - `GET /api/admin/users/{id}/clients`（超级管理员查看用户已绑定客户端）
 - `DELETE /api/admin/users/{id}/clients/{sessionId}`（超级管理员解绑客户端）
+- `PUT /api/admin/users/{id}/authorized-modes`（超级管理员设置账号可见模式菜单）
 - `PATCH /api/admin/users/{id}/client-limit`（超级管理员设置客户端数量上限）
 - `GET /api/admin/invite-codes`（超级管理员查看最近生成的邀请码）
 - `POST /api/admin/invite-codes`（超级管理员生成一次性限时邀请码）

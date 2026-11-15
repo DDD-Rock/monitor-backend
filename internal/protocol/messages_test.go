@@ -140,6 +140,13 @@ func TestValidateEnvelopeAcceptsTempleClientState(t *testing.T) {
 	}
 }
 
+func TestValidateEnvelopeAcceptsEmulatorClientState(t *testing.T) {
+	message := []byte(`{"type":"client_state","sequence":1,"payload":{"mode":"emulator","running":true}}`)
+	if _, err := ValidateEnvelope(message); err != nil {
+		t.Fatalf("expected emulator client state to remain connected, got %v", err)
+	}
+}
+
 func TestValidateEnvelopeAcceptsTeamJoined(t *testing.T) {
 	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色","receiptId":"receipt-123"}}`)
 	if _, err := ValidateEnvelope(message); err != nil {

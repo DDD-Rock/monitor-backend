@@ -82,8 +82,11 @@ func TestUserModePermissions(t *testing.T) {
 		t.Fatal("regular mode permission check is incorrect")
 	}
 	admin := userModePermissions{IsSuperAdmin: 1}
-	if len(admin.authorizedModes()) != 5 || !admin.allows("monitor") || !admin.allows("follow_heal") {
+	if len(admin.authorizedModes()) != 6 || !admin.allows("monitor") || !admin.allows("follow_heal") || !admin.allows("emulator") {
 		t.Fatal("super admin should have all modes")
+	}
+	if !(userModePermissions{Emulator: 1}).allows("emulator") {
+		t.Fatal("emulator mode permission check is incorrect")
 	}
 }
 

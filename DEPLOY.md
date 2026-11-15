@@ -49,7 +49,18 @@ mysql -u root -p autobuff_monitor < exp_gain_migration.sql
 ```bash
 mysql -u root -p autobuff_monitor < migrations/client_management_migration.sql
 mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration.sql
+mysql -u root -p autobuff_monitor < migrations/user_emulator_mode_authorization_migration.sql
 ```
+
+挑衅模式账号授权升级：已有数据库先执行一次迁移，再发布新版后端和网页。
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/taunt_mode_authorization_migration.sql
+```
+
+该字段默认为 `0`，已有普通账号和新注册账号均不会自动获得挑衅权限。需要时由
+超级管理员在网页用户管理中勾选“挑衅模式”。全新安装已包含在 `monitor_schema.sql`，
+不应重复执行该迁移。
 
 挂绳组队运行状态改为内存管理后，部署新版后端再删除旧运行状态表：
 

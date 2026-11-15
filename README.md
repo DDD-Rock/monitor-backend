@@ -33,6 +33,17 @@ mysql -u root -p autobuff_monitor < migrations/user_mode_authorization_migration
 mysql -u root -p autobuff_monitor < migrations/user_emulator_mode_authorization_migration.sql
 ```
 
+挑衅模式升级需先对已有数据库执行一次以下迁移，再部署新版后端和网页：
+
+```bash
+mysql -u root -p autobuff_monitor < migrations/taunt_mode_authorization_migration.sql
+```
+
+新建数据库已在 `monitor_schema.sql` 包含该字段，无需重复执行迁移。
+普通账号（包括已有账号和新注册账号）默认不开通挑衅模式；超级管理员可在用户管理的
+模式授权中单独勾选。登录、客户端授权查询及运行状态校验统一使用该权限，超级管理员
+沿用所有模式可用的规则。
+
 超级管理员只能直接在数据库中授予：
 
 ```sql

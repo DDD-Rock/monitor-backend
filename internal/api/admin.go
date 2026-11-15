@@ -32,13 +32,14 @@ type userModePermissions struct {
 	FollowHeal   uint8
 	Monitor      uint8
 	Emulator     uint8
+	Taunt        uint8
 }
 
 func (p userModePermissions) authorizedModes() []string {
 	if p.IsSuperAdmin == 1 {
-		return []string{"dead", "live", "temple", "follow_heal", "monitor", "emulator"}
+		return []string{"dead", "live", "temple", "follow_heal", "monitor", "emulator", "taunt"}
 	}
-	modes := make([]string, 0, 6)
+	modes := make([]string, 0, 7)
 	if p.Dead == 1 {
 		modes = append(modes, "dead")
 	}
@@ -56,6 +57,9 @@ func (p userModePermissions) authorizedModes() []string {
 	}
 	if p.Emulator == 1 {
 		modes = append(modes, "emulator")
+	}
+	if p.Taunt == 1 {
+		modes = append(modes, "taunt")
 	}
 	return modes
 }
@@ -75,6 +79,8 @@ func (p userModePermissions) allows(mode string) bool {
 		return p.FollowHeal == 1
 	case "monitor":
 		return p.Monitor == 1
+	case "taunt":
+		return p.Taunt == 1
 	case "emulator":
 		return p.Emulator == 1
 	default:
@@ -86,8 +92,8 @@ func (s *Server) loadUserModePermissions(ctx context.Context, userID int64) (use
 	var p userModePermissions
 	err := s.db.QueryRowContext(ctx, `SELECT is_super_admin, dead_mode_enabled, live_mode_enabled,
 		temple_mode_enabled, follow_heal_mode_enabled, monitor_mode_enabled,
-		emulator_mode_enabled FROM users WHERE id = ?`, userID).
-		Scan(&p.IsSuperAdmin, &p.Dead, &p.Live, &p.Temple, &p.FollowHeal, &p.Monitor, &p.Emulator)
+		emulator_mode_enabled, taunt_mode_enabled FROM users WHERE id = ?`, userID).
+		Scan(&p.IsSuperAdmin, &p.Dead, &p.Live, &p.Temple, &p.FollowHeal, &p.Monitor, &p.Emulator, &p.Taunt)
 	return p, err
 }
 
@@ -96,13 +102,13 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		`SELECT u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
 		        u.max_client_count, u.dead_mode_enabled, u.live_mode_enabled, u.temple_mode_enabled,
-		        u.follow_heal_mode_enabled, u.monitor_mode_enabled, u.emulator_mode_enabled,
+		        u.follow_heal_mode_enabled, u.monitor_mode_enabled, u.emulator_mode_enabled, u.taunt_mode_enabled,
 		        COUNT(CASE WHEN ms.status = 1 AND ms.client_id IS NOT NULL THEN 1 END)
 		 FROM users u
 		 LEFT JOIN monitor_sessions ms ON ms.user_id = u.id
 		 GROUP BY u.id, u.nickname, u.status, u.is_super_admin, u.created_at, u.last_login_at,
 		          u.max_client_count, u.dead_mode_enabled, u.live_mode_enabled, u.temple_mode_enabled,
-		          u.follow_heal_mode_enabled, u.monitor_mode_enabled, u.emulator_mode_enabled
+		          u.follow_heal_mode_enabled, u.monitor_mode_enabled, u.emulator_mode_enabled, u.taunt_mode_enabled
 		 ORDER BY u.created_at DESC`,
 	)
 	if err != nil {
@@ -114,19 +120,19 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var item adminUserItem
 		var isSuperAdmin uint8
-		var dead, live, temple, followHeal, monitor, emulator uint8
+		var dead, live, temple, followHeal, monitor, emulator, taunt uint8
 		var createdAt time.Time
 		var lastLogin sql.NullTime
 		if err := rows.Scan(
 			&item.ID, &item.Nickname, &item.Status, &isSuperAdmin,
-			&createdAt, &lastLogin, &item.MaxClientCount, &dead, &live, &temple, &followHeal, &monitor, &emulator,
+			&createdAt, &lastLogin, &item.MaxClientCount, &dead, &live, &temple, &followHeal, &monitor, &emulator, &taunt,
 			&item.ConnectedCount,
 		); err != nil {
 			s.internalError(w, "scan users failed", err)
 			return
 		}
 		item.IsSuperAdmin = isSuperAdmin == 1
-		item.AuthorizedModes = userModePermissions{IsSuperAdmin: isSuperAdmin, Dead: dead, Live: live, Temple: temple, FollowHeal: followHeal, Monitor: monitor, Emulator: emulator}.authorizedModes()
+		item.AuthorizedModes = userModePermissions{IsSuperAdmin: isSuperAdmin, Dead: dead, Live: live, Temple: temple, FollowHeal: followHeal, Monitor: monitor, Emulator: emulator, Taunt: taunt}.authorizedModes()
 		item.CreatedAt = createdAt.UnixMilli()
 		if lastLogin.Valid {
 			value := lastLogin.Time.UnixMilli()
@@ -238,7 +244,7 @@ func (s *Server) handleAdminUserAuthorizedModes(w http.ResponseWriter, r *http.R
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	allowed := map[string]bool{"dead": false, "live": false, "temple": false, "follow_heal": false, "monitor": false, "emulator": false}
+	allowed := map[string]bool{"dead": false, "live": false, "temple": false, "follow_heal": false, "monitor": false, "emulator": false, "taunt": false}
 	for _, mode := range request.Modes {
 		if _, exists := allowed[mode]; !exists {
 			writeError(w, http.StatusBadRequest, "invalid_mode", "模式授权无效")
@@ -246,7 +252,7 @@ func (s *Server) handleAdminUserAuthorizedModes(w http.ResponseWriter, r *http.R
 		}
 		allowed[mode] = true
 	}
-	result, err := s.db.ExecContext(r.Context(), `UPDATE users SET dead_mode_enabled=?, live_mode_enabled=?, temple_mode_enabled=?, follow_heal_mode_enabled=?, monitor_mode_enabled=?, emulator_mode_enabled=? WHERE id=?`, boolToUint(allowed["dead"]), boolToUint(allowed["live"]), boolToUint(allowed["temple"]), boolToUint(allowed["follow_heal"]), boolToUint(allowed["monitor"]), boolToUint(allowed["emulator"]), userID)
+	result, err := s.db.ExecContext(r.Context(), `UPDATE users SET dead_mode_enabled=?, live_mode_enabled=?, temple_mode_enabled=?, follow_heal_mode_enabled=?, monitor_mode_enabled=?, emulator_mode_enabled=?, taunt_mode_enabled=? WHERE id=?`, boolToUint(allowed["dead"]), boolToUint(allowed["live"]), boolToUint(allowed["temple"]), boolToUint(allowed["follow_heal"]), boolToUint(allowed["monitor"]), boolToUint(allowed["emulator"]), boolToUint(allowed["taunt"]), userID)
 	if err != nil {
 		s.internalError(w, "update user mode permissions failed", err)
 		return

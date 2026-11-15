@@ -290,7 +290,7 @@ func ValidateEnvelope(message []byte) (Envelope, error) {
 			return Envelope{}, errors.New("invalid client state payload")
 		}
 		switch payload.Mode {
-		case "dead", "live", "follow_heal", "monitor", "temple", "emulator":
+		case "dead", "live", "follow_heal", "monitor", "temple", "emulator", "taunt":
 		default:
 			return Envelope{}, errors.New("invalid client mode")
 		}

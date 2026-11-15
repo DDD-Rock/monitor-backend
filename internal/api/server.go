@@ -313,11 +313,11 @@ func (s *Server) respondWithAccessToken(w http.ResponseWriter, userID int64, use
 	_ = s.db.QueryRow(
 		`SELECT nickname, is_super_admin, dead_mode_enabled, live_mode_enabled,
 		        temple_mode_enabled, follow_heal_mode_enabled, monitor_mode_enabled,
-		        emulator_mode_enabled
+		        emulator_mode_enabled, taunt_mode_enabled
 		 FROM users WHERE id = ?`, userID,
 	).Scan(
 		&nickname, &permissions.IsSuperAdmin, &permissions.Dead, &permissions.Live,
-		&permissions.Temple, &permissions.FollowHeal, &permissions.Monitor, &permissions.Emulator,
+		&permissions.Temple, &permissions.FollowHeal, &permissions.Monitor, &permissions.Emulator, &permissions.Taunt,
 	)
 	writeJSON(w, status, map[string]any{
 		"accessToken": token,

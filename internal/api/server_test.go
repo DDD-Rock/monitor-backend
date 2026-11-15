@@ -78,11 +78,19 @@ func TestUserModePermissions(t *testing.T) {
 	if got := strings.Join(regular.authorizedModes(), ","); got != "dead,live,temple" {
 		t.Fatalf("default modes = %q", got)
 	}
-	if regular.allows("monitor") || !regular.allows("temple") || regular.allows("unknown") {
+	if regular.allows("monitor") || regular.allows("taunt") || !regular.allows("temple") || regular.allows("unknown") {
 		t.Fatal("regular mode permission check is incorrect")
 	}
+	regular.Taunt = 1
+	if got := strings.Join(regular.authorizedModes(), ","); got != "dead,live,temple,taunt" || !regular.allows("taunt") {
+		t.Fatalf("explicit taunt grant was not applied: %q", got)
+	}
+	regular.Taunt = 0
+	if got := strings.Join(regular.authorizedModes(), ","); got != "dead,live,temple" || regular.allows("taunt") {
+		t.Fatalf("taunt revocation was not applied: %q", got)
+	}
 	admin := userModePermissions{IsSuperAdmin: 1}
-	if len(admin.authorizedModes()) != 6 || !admin.allows("monitor") || !admin.allows("follow_heal") || !admin.allows("emulator") {
+	if got := strings.Join(admin.authorizedModes(), ","); got != "dead,live,temple,follow_heal,monitor,emulator,taunt" || !admin.allows("monitor") || !admin.allows("follow_heal") || !admin.allows("emulator") || !admin.allows("taunt") {
 		t.Fatal("super admin should have all modes")
 	}
 	if !(userModePermissions{Emulator: 1}).allows("emulator") {

@@ -147,6 +147,24 @@ func TestValidateEnvelopeAcceptsEmulatorClientState(t *testing.T) {
 	}
 }
 
+func TestValidateEnvelopeAcceptsTauntClientState(t *testing.T) {
+	for _, message := range []string{
+		`{"type":"client_state","sequence":1,"payload":{"mode":"taunt","running":true}}`,
+		`{"type":"client_state","sequence":2,"payload":{"mode":"taunt","running":false}}`,
+	} {
+		if _, err := ValidateEnvelope([]byte(message)); err != nil {
+			t.Fatalf("expected taunt client state to remain connected, got %v", err)
+		}
+	}
+}
+
+func TestValidateEnvelopeRejectsUnknownClientMode(t *testing.T) {
+	message := []byte(`{"type":"client_state","sequence":1,"payload":{"mode":"unknown","running":true}}`)
+	if _, err := ValidateEnvelope(message); err == nil {
+		t.Fatal("expected unknown client mode to be rejected")
+	}
+}
+
 func TestValidateEnvelopeAcceptsTeamJoined(t *testing.T) {
 	message := []byte(`{"type":"team_joined","sequence":2,"payload":{"teamId":7,"roleName":"测试角色","receiptId":"receipt-123"}}`)
 	if _, err := ValidateEnvelope(message); err != nil {
